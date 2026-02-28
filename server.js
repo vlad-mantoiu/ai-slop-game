@@ -1065,6 +1065,13 @@ function finalizeVotes(roomId, reason) {
   const second = ranked[1];
   const tied = top && second && top.votes === second.votes;
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[finalizeVotes] room=${room.id} reason=${reason} votes=${room.votes.size}/${room.players.size} ranked=${ranked
+      .map((entry) => `${entry.playerName}:${entry.votes}`)
+      .join(",")}`
+  );
+
   if (!top || tied) {
     room.tiebreakerNextRound = true;
     emitRoundResult(room, {
@@ -1077,6 +1084,16 @@ function finalizeVotes(roomId, reason) {
   }
 
   const winner = room.players.get(top.playerId);
+  if (!winner) {
+    room.tiebreakerNextRound = true;
+    emitRoundResult(room, {
+      tie: true,
+      reason: "missing-winner",
+      winnerIds: []
+    });
+    beginReadyUp(room);
+    return;
+  }
   winner.score += 1;
 
   const ended = winner.score >= TO_WIN;
@@ -1526,6 +1543,11 @@ io.on("connection", (socket) => {
     }
 
     room.votes.set(voter.id, targetId);
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[castVote] room=${room.id} voter=${voter.name} target=${targetId} total=${room.votes.size}/${room.players.size}`
+    );
 
     io.to(room.id).emit("voteUpdate", {
       totalVotes: room.votes.size,

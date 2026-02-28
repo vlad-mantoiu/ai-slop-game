@@ -914,21 +914,38 @@ function renderResults() {
     ? [...state.result.leaderboard]
     : sortedPlayers().map((p) => ({ id: p.id, name: p.name, score: p.score }));
 
-  const winner = board[0] || null;
-  const runner = board[1] || null;
-  const winnerSubmission = state.result?.submissions?.find((sub) => sub.playerId === winner?.id);
+  const submissions = Array.isArray(state.result?.submissions) ? [...state.result.submissions] : [];
+  const winnerIds = Array.isArray(state.result?.winnerIds) ? state.result.winnerIds : [];
+
+  const rankedByRound = submissions.sort((a, b) => {
+    if (state.room.players.length === 2) {
+      return (Number(b.score) || 0) - (Number(a.score) || 0);
+    }
+    return (Number(b.votes) || 0) - (Number(a.votes) || 0);
+  });
+
+  const roundWinnerId = winnerIds[0] || rankedByRound[0]?.playerId || "";
+  const roundRunnerId = rankedByRound.find((entry) => entry.playerId !== roundWinnerId)?.playerId || "";
+
+  const winner = (roundWinnerId && board.find((player) => player.id === roundWinnerId)) || board[0] || null;
+  const runner = (roundRunnerId && board.find((player) => player.id === roundRunnerId)) || board[1] || null;
+  const winnerSubmission = submissions.find((sub) => sub.playerId === winner?.id);
 
   if (state.room.phase === "ended") {
     dom.resultTitle.textContent = "Match Complete";
-    dom.resultSubtitle.textContent = winner
-      ? `${winner.name} reached ${state.room.toWin} points and wins the game.`
+    const matchWinner = board[0] || winner;
+    dom.resultSubtitle.textContent = matchWinner
+      ? `${matchWinner.name} reached ${state.room.toWin} points and wins the game.`
       : "Match ended.";
   } else if (state.result?.tie) {
     dom.resultTitle.textContent = `Round ${state.room.roundNumber} Tied`;
     dom.resultSubtitle.textContent = "Chaos tiebreaker next round with double powerups.";
   } else {
     dom.resultTitle.textContent = `Round ${state.room.roundNumber} Results`;
-    dom.resultSubtitle.textContent = winner
+    const roundWinner = (roundWinnerId && board.find((player) => player.id === roundWinnerId)) || winner;
+    dom.resultSubtitle.textContent = roundWinner
+      ? `${roundWinner.name} won this round.`
+      : winner
       ? `${winner.name} won this round.`
       : "Round complete.";
   }
