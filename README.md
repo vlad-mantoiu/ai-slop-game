@@ -23,7 +23,7 @@ Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
 
 ### Against Humanity Prompt Pool
 
-- Stored black-card prompts in [`data/against-humanity-prompts.json`](data/against-humanity-prompts.json).
+- Stored black-card prompts in [`config/against-humanity-prompts.json`](config/against-humanity-prompts.json).
 - Prompt order is shuffled per session to reduce repeats.
 
 ## Credits & Billing

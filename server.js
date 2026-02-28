@@ -39,7 +39,12 @@ const PLAYER_IMAGE_PROVIDER = String(process.env.PLAYER_IMAGE_PROVIDER || IMAGE_
 const REFERENCE_IMAGE_PROVIDER = String(process.env.REFERENCE_IMAGE_PROVIDER || IMAGE_PROVIDER)
   .trim()
   .toLowerCase();
-const BLACK_CARD_PROMPT_FILE = path.join(__dirname, "data", "against-humanity-prompts.json");
+const BLACK_CARD_PROMPT_FILE = String(process.env.BLACK_CARD_PROMPT_FILE || "").trim();
+const BLACK_CARD_PROMPT_FILE_CANDIDATES = [
+  BLACK_CARD_PROMPT_FILE,
+  path.join(__dirname, "config", "against-humanity-prompts.json"),
+  path.join(__dirname, "data", "against-humanity-prompts.json")
+].filter(Boolean);
 const BILLING_STORE_FILE = path.join(__dirname, "data", "billing-store.json");
 const BILLING_COOKIE_NAME = "slop_uid";
 const IMAGE_COST_CENTS = Math.max(1, Number(process.env.IMAGE_COST_CENTS || 2));
@@ -579,19 +584,24 @@ const AVATAR_CATALOG = loadAvatarCatalog();
 const AVATAR_BY_ID = new Map(AVATAR_CATALOG.map((avatar) => [avatar.id, avatar]));
 
 function loadBlackCardPromptCatalog() {
-  try {
-    const raw = fs.readFileSync(BLACK_CARD_PROMPT_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
+  for (const file of BLACK_CARD_PROMPT_FILE_CANDIDATES) {
+    try {
+      const raw = fs.readFileSync(file, "utf8");
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        continue;
+      }
+      const cleaned = parsed
+        .map((value) => sanitizePrompt(value))
+        .filter(Boolean);
+      if (cleaned.length > 0) {
+        return [...new Set(cleaned)];
+      }
+    } catch {
+      // try next candidate
     }
-    const cleaned = parsed
-      .map((value) => sanitizePrompt(value))
-      .filter(Boolean);
-    return [...new Set(cleaned)];
-  } catch {
-    return [];
   }
+  return [];
 }
 
 const BLACK_CARD_PROMPT_CATALOG = loadBlackCardPromptCatalog();
