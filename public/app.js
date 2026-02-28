@@ -467,69 +467,13 @@ function stopAmbientLoop() {
 }
 
 function setAmbientLoop(mode) {
-  const nextMode = String(mode || "");
-  if (!canPlaySound()) {
-    stopAmbientLoop();
-    return;
-  }
-  if (audioEngine.ambientMode === nextMode) return;
+  // Ambient background music disabled by request.
+  void mode;
   stopAmbientLoop();
-  audioEngine.ambientMode = nextMode;
-
-  if (nextMode === "lobby") {
-    playTone(170, { type: "sine", hold: 0.08, release: 0.24, level: 0.08 });
-    audioEngine.ambientTimer = setInterval(() => {
-      playTone(165, { type: "sine", hold: 0.06, release: 0.2, level: 0.08 });
-      playTone(220, { type: "sine", delay: 0.2, hold: 0.05, release: 0.18, level: 0.06 });
-    }, 1900);
-    return;
-  }
-
-  if (nextMode === "round") {
-    playTone(210, { type: "triangle", hold: 0.05, release: 0.16, level: 0.09 });
-    audioEngine.ambientTimer = setInterval(() => {
-      playTone(210, { type: "triangle", hold: 0.035, release: 0.12, level: 0.08 });
-      playTone(260, { type: "sine", delay: 0.15, hold: 0.02, release: 0.09, level: 0.06 });
-    }, 1450);
-    return;
-  }
-
-  if (nextMode === "showcase") {
-    playTone(280, { type: "sine", hold: 0.08, release: 0.24, level: 0.08 });
-    audioEngine.ambientTimer = setInterval(() => {
-      playTone(280, { type: "sine", hold: 0.05, release: 0.2, level: 0.07 });
-      playTone(360, { type: "triangle", delay: 0.18, hold: 0.04, release: 0.16, level: 0.06 });
-    }, 1750);
-    return;
-  }
-
-  if (nextMode === "voting") {
-    playTone(250, { type: "square", hold: 0.02, release: 0.1, level: 0.08 });
-    audioEngine.ambientTimer = setInterval(() => {
-      playTone(250, { type: "square", hold: 0.02, release: 0.08, level: 0.07 });
-      playTone(220, { type: "square", delay: 0.2, hold: 0.015, release: 0.07, level: 0.06 });
-    }, 950);
-    return;
-  }
 }
 
 function applyAmbientForPhase(phase) {
-  if (phase === "lobby" || phase === "intermission" || phase === "starting") {
-    setAmbientLoop("lobby");
-    return;
-  }
-  if (phase === "round" || phase === "generating") {
-    setAmbientLoop("round");
-    return;
-  }
-  if (phase === "showcase") {
-    setAmbientLoop("showcase");
-    return;
-  }
-  if (phase === "voting") {
-    setAmbientLoop("voting");
-    return;
-  }
+  void phase;
   stopAmbientLoop();
 }
 
