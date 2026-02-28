@@ -21,7 +21,12 @@
             <p class="subtitle">Realtime chaos prompt battles</p>
           </div>
         </div>
-        <div class="room-pill" id="roomBadge">No room</div>
+        <div class="topbar-tools">
+          <button id="soundToggleBtn" class="sound-toggle" type="button" aria-pressed="false">
+            Sound: Off
+          </button>
+          <div class="room-pill" id="roomBadge">No room</div>
+        </div>
       </header>
 
       <section id="authScreen" class="screen">
@@ -287,6 +292,17 @@
         </div>
       </section>
     </main>
+
+    <section id="phaseBanner" class="phase-banner hidden" aria-live="polite">
+      <div class="phase-banner-card">
+        <p id="phaseBannerTitle" class="phase-banner-title">Round Start</p>
+        <p id="phaseBannerSubtitle" class="phase-banner-subtitle"></p>
+      </div>
+    </section>
+
+    <section id="calloutToast" class="callout-toast hidden" aria-live="polite"></section>
+
+    <div id="confettiLayer" class="confetti-layer" aria-hidden="true"></div>
 
     <section class="feed-dock card">
       <div class="row between compact">

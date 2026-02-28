@@ -49,6 +49,20 @@ const state = {
   boundSocketId: "",
   bindSocketToken: "",
   bindSocketTokenExpiresAt: 0,
+  soundEnabled: false,
+  phaseBannerUntil: 0,
+  phaseBannerToken: 0,
+  calloutUntil: 0,
+  calloutToken: 0,
+  roundUrgencyStage: "",
+  voteUrgencyStage: "",
+  roundLastBeepSecond: -1,
+  voteLastBeepSecond: -1,
+  lastPromptMutationAt: 0,
+  lastPhaseFxPhase: "",
+  lastPhaseFxAt: 0,
+  scoreByPlayerId: {},
+  winStreakByPlayerId: {},
   feed: [],
   inputDebounce: null
 };
@@ -95,6 +109,7 @@ const dom = {
   authLoginBtn: document.getElementById("authLoginBtn"),
   authRegisterBtn: document.getElementById("authRegisterBtn"),
   authLogoutBtn: document.getElementById("authLogoutBtn"),
+  soundToggleBtn: document.getElementById("soundToggleBtn"),
   creditPacks: document.getElementById("creditPacks"),
 
   roundLabel: document.getElementById("roundLabel"),
@@ -103,6 +118,9 @@ const dom = {
   promptStatus: document.getElementById("promptStatus"),
   promptPhaseNote: document.getElementById("promptPhaseNote"),
   referenceTitle: document.getElementById("referenceTitle"),
+  promptLayout: document.querySelector(".prompt-layout"),
+  promptSide: document.querySelector(".prompt-side"),
+  referenceWrap: document.querySelector(".reference-wrap"),
 
   sabotageToast: document.getElementById("sabotageToast"),
   referenceImg: document.getElementById("referenceImg"),
@@ -135,6 +153,7 @@ const dom = {
 
   resultTitle: document.getElementById("resultTitle"),
   resultSubtitle: document.getElementById("resultSubtitle"),
+  winnerCard: document.querySelector(".winner-card"),
   winnerName: document.getElementById("winnerName"),
   winnerMetric: document.getElementById("winnerMetric"),
   winnerPromptText: document.getElementById("winnerPromptText"),
@@ -151,6 +170,11 @@ const dom = {
   powerupTargetMenu: document.getElementById("powerupTargetMenu"),
   loadingOverlay: document.getElementById("loadingOverlay"),
   loadingText: document.getElementById("loadingText"),
+  phaseBanner: document.getElementById("phaseBanner"),
+  phaseBannerTitle: document.getElementById("phaseBannerTitle"),
+  phaseBannerSubtitle: document.getElementById("phaseBannerSubtitle"),
+  calloutToast: document.getElementById("calloutToast"),
+  confettiLayer: document.getElementById("confettiLayer"),
   imageLightbox: document.getElementById("imageLightbox"),
   imageLightboxImg: document.getElementById("imageLightboxImg"),
   imageLightboxCaption: document.getElementById("imageLightboxCaption"),
@@ -259,6 +283,515 @@ function currentModeMeta() {
 function modeTooltipText(modeId) {
   const id = String(modeId || "").trim();
   return MODE_TOOLTIPS[id] || "Pick a mode to see how that match style plays.";
+}
+
+const audioEngine = {
+  ctx: null,
+  master: null,
+  unlocked: false,
+  ambientMode: "",
+  ambientTimer: null
+};
+
+const PHASE_BANNER_META = {
+  lobby: { title: "Back To Lobby", subtitle: "Regroup and start chaos again." },
+  starting: { title: "Match Starting", subtitle: "Rolling camera. Loading madness." },
+  round: { title: "Prompt Phase", subtitle: "Write fast. Sabotage faster." },
+  generating: { title: "Generation Locked", subtitle: "The slop forge is heating up." },
+  showcase: { title: "Cinematic Showcase", subtitle: "Anonymous masterpieces entering the spotlight." },
+  voting: { title: "Voting Open", subtitle: "Pick the image that nails the brief." },
+  intermission: { title: "Ready Check", subtitle: "Everyone clicks ready to continue." },
+  ended: { title: "Match Finished", subtitle: "Winner crowned. Debrief the chaos." }
+};
+
+function updateSoundToggleUi() {
+  const enabled = Boolean(state.soundEnabled);
+  dom.soundToggleBtn.textContent = enabled ? "Sound: On" : "Sound: Off";
+  dom.soundToggleBtn.classList.toggle("is-on", enabled);
+  dom.soundToggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
+}
+
+function ensureAudioContext() {
+  if (audioEngine.ctx) return audioEngine.ctx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  audioEngine.ctx = new Ctx();
+  audioEngine.master = audioEngine.ctx.createGain();
+  audioEngine.master.gain.value = 0.11;
+  audioEngine.master.connect(audioEngine.ctx.destination);
+  return audioEngine.ctx;
+}
+
+async function unlockAudio() {
+  const ctx = ensureAudioContext();
+  if (!ctx) return false;
+  try {
+    await ctx.resume();
+    audioEngine.unlocked = ctx.state === "running";
+  } catch {
+    audioEngine.unlocked = false;
+  }
+  return audioEngine.unlocked;
+}
+
+function canPlaySound() {
+  return Boolean(state.soundEnabled && audioEngine.unlocked && audioEngine.ctx && audioEngine.master);
+}
+
+function soundEnvelope(node, startAt, attack = 0.008, hold = 0.06, release = 0.1, level = 1) {
+  const gain = audioEngine.ctx.createGain();
+  gain.gain.setValueAtTime(0.0001, startAt);
+  gain.gain.linearRampToValueAtTime(level, startAt + attack);
+  gain.gain.setValueAtTime(level, startAt + attack + hold);
+  gain.gain.exponentialRampToValueAtTime(0.0001, startAt + attack + hold + release);
+  node.connect(gain);
+  gain.connect(audioEngine.master);
+}
+
+function playTone(freq, opts = {}) {
+  if (!canPlaySound()) return;
+  const ctx = audioEngine.ctx;
+  const startAt = ctx.currentTime + Math.max(0, Number(opts.delay) || 0);
+  const osc = ctx.createOscillator();
+  osc.type = opts.type || "sine";
+  osc.frequency.setValueAtTime(Math.max(40, Number(freq) || 220), startAt);
+  if (Number.isFinite(opts.endFreq)) {
+    osc.frequency.exponentialRampToValueAtTime(Math.max(40, Number(opts.endFreq)), startAt + 0.12);
+  }
+  soundEnvelope(
+    osc,
+    startAt,
+    Number(opts.attack) || 0.005,
+    Number(opts.hold) || 0.04,
+    Number(opts.release) || 0.09,
+    Number(opts.level) || 0.55
+  );
+  osc.start(startAt);
+  osc.stop(startAt + 0.32);
+}
+
+function playNoiseHit(opts = {}) {
+  if (!canPlaySound()) return;
+  const ctx = audioEngine.ctx;
+  const startAt = ctx.currentTime + Math.max(0, Number(opts.delay) || 0);
+  const noise = ctx.createBufferSource();
+  const size = Math.floor(ctx.sampleRate * 0.18);
+  const buffer = ctx.createBuffer(1, size, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < size; i += 1) {
+    data[i] = (Math.random() * 2 - 1) * (1 - i / size);
+  }
+  noise.buffer = buffer;
+
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.setValueAtTime(Number(opts.freq) || 1400, startAt);
+  filter.Q.value = Number(opts.q) || 1.4;
+  noise.connect(filter);
+  soundEnvelope(
+    filter,
+    startAt,
+    Number(opts.attack) || 0.002,
+    Number(opts.hold) || 0.015,
+    Number(opts.release) || 0.08,
+    Number(opts.level) || 0.35
+  );
+  noise.start(startAt);
+  noise.stop(startAt + 0.2);
+}
+
+function playUiClick() {
+  playTone(620, { type: "triangle", hold: 0.015, release: 0.06, level: 0.26 });
+}
+
+function playPhaseStinger(phase) {
+  if (phase === "round") {
+    playTone(260, { type: "sawtooth", hold: 0.02, release: 0.08, level: 0.38 });
+    playTone(392, { type: "sawtooth", delay: 0.07, hold: 0.02, release: 0.08, level: 0.36 });
+    playTone(523, { type: "triangle", delay: 0.14, hold: 0.03, release: 0.1, level: 0.34 });
+    return;
+  }
+  if (phase === "showcase") {
+    playTone(320, { type: "sine", hold: 0.04, release: 0.16, level: 0.32 });
+    playTone(480, { type: "triangle", delay: 0.1, hold: 0.04, release: 0.16, level: 0.28 });
+    return;
+  }
+  if (phase === "voting") {
+    playTone(600, { type: "square", hold: 0.02, release: 0.08, level: 0.28 });
+    playTone(760, { type: "square", delay: 0.09, hold: 0.02, release: 0.08, level: 0.24 });
+    return;
+  }
+  if (phase === "intermission") {
+    playTone(280, { type: "triangle", hold: 0.02, release: 0.1, level: 0.24 });
+    return;
+  }
+  if (phase === "ended") {
+    playTone(392, { type: "triangle", hold: 0.08, release: 0.18, level: 0.38 });
+    playTone(523, { type: "triangle", delay: 0.12, hold: 0.09, release: 0.2, level: 0.35 });
+  }
+}
+
+function playSabotageFxSound(kind) {
+  if (kind === "blackout") {
+    playNoiseHit({ freq: 320, q: 0.8, release: 0.14, level: 0.45 });
+    return;
+  }
+  if (kind === "erase") {
+    playNoiseHit({ freq: 920, q: 2.4, release: 0.1, level: 0.35 });
+    playTone(180, { type: "sawtooth", delay: 0.05, hold: 0.02, release: 0.07, level: 0.28 });
+    return;
+  }
+  if (kind === "scramble") {
+    playTone(430, { type: "square", hold: 0.015, release: 0.05, level: 0.26 });
+    playTone(512, { type: "square", delay: 0.05, hold: 0.015, release: 0.05, level: 0.24 });
+    return;
+  }
+  playTone(260, { type: "triangle", hold: 0.02, release: 0.08, level: 0.25 });
+  playTone(340, { type: "triangle", delay: 0.06, hold: 0.02, release: 0.08, level: 0.23 });
+}
+
+function playCountdownBeep(stage = "warn") {
+  if (stage === "critical") {
+    playTone(980, { type: "square", hold: 0.008, release: 0.04, level: 0.2 });
+    return;
+  }
+  playTone(760, { type: "triangle", hold: 0.01, release: 0.06, level: 0.17 });
+}
+
+function stopAmbientLoop() {
+  if (audioEngine.ambientTimer) {
+    clearInterval(audioEngine.ambientTimer);
+    audioEngine.ambientTimer = null;
+  }
+  audioEngine.ambientMode = "";
+}
+
+function setAmbientLoop(mode) {
+  const nextMode = String(mode || "");
+  if (!canPlaySound()) {
+    stopAmbientLoop();
+    return;
+  }
+  if (audioEngine.ambientMode === nextMode) return;
+  stopAmbientLoop();
+  audioEngine.ambientMode = nextMode;
+
+  if (nextMode === "lobby") {
+    playTone(170, { type: "sine", hold: 0.08, release: 0.24, level: 0.08 });
+    audioEngine.ambientTimer = setInterval(() => {
+      playTone(165, { type: "sine", hold: 0.06, release: 0.2, level: 0.08 });
+      playTone(220, { type: "sine", delay: 0.2, hold: 0.05, release: 0.18, level: 0.06 });
+    }, 1900);
+    return;
+  }
+
+  if (nextMode === "round") {
+    playTone(210, { type: "triangle", hold: 0.05, release: 0.16, level: 0.09 });
+    audioEngine.ambientTimer = setInterval(() => {
+      playTone(210, { type: "triangle", hold: 0.035, release: 0.12, level: 0.08 });
+      playTone(260, { type: "sine", delay: 0.15, hold: 0.02, release: 0.09, level: 0.06 });
+    }, 1450);
+    return;
+  }
+
+  if (nextMode === "showcase") {
+    playTone(280, { type: "sine", hold: 0.08, release: 0.24, level: 0.08 });
+    audioEngine.ambientTimer = setInterval(() => {
+      playTone(280, { type: "sine", hold: 0.05, release: 0.2, level: 0.07 });
+      playTone(360, { type: "triangle", delay: 0.18, hold: 0.04, release: 0.16, level: 0.06 });
+    }, 1750);
+    return;
+  }
+
+  if (nextMode === "voting") {
+    playTone(250, { type: "square", hold: 0.02, release: 0.1, level: 0.08 });
+    audioEngine.ambientTimer = setInterval(() => {
+      playTone(250, { type: "square", hold: 0.02, release: 0.08, level: 0.07 });
+      playTone(220, { type: "square", delay: 0.2, hold: 0.015, release: 0.07, level: 0.06 });
+    }, 950);
+    return;
+  }
+}
+
+function applyAmbientForPhase(phase) {
+  if (phase === "lobby" || phase === "intermission" || phase === "starting") {
+    setAmbientLoop("lobby");
+    return;
+  }
+  if (phase === "round" || phase === "generating") {
+    setAmbientLoop("round");
+    return;
+  }
+  if (phase === "showcase") {
+    setAmbientLoop("showcase");
+    return;
+  }
+  if (phase === "voting") {
+    setAmbientLoop("voting");
+    return;
+  }
+  stopAmbientLoop();
+}
+
+function setSoundEnabled(nextEnabled) {
+  state.soundEnabled = Boolean(nextEnabled);
+  try {
+    window.localStorage.setItem("psa-sound-enabled", state.soundEnabled ? "1" : "0");
+  } catch {
+    // ignore storage failures
+  }
+  updateSoundToggleUi();
+  if (!state.soundEnabled) {
+    stopAmbientLoop();
+    return;
+  }
+  unlockAudio().then((ok) => {
+    if (!ok) return;
+    playUiClick();
+    applyAmbientForPhase(state.room?.phase || "");
+  });
+}
+
+function showPhaseBanner(title, subtitle = "", durationMs = 1600) {
+  const token = Date.now() + Math.floor(Math.random() * 10000);
+  state.phaseBannerToken = token;
+  state.phaseBannerUntil = Date.now() + durationMs;
+  dom.phaseBannerTitle.textContent = title || "";
+  dom.phaseBannerSubtitle.textContent = subtitle || "";
+  dom.phaseBanner.classList.remove("hidden");
+  dom.phaseBanner.classList.remove("is-active");
+  void dom.phaseBanner.offsetWidth;
+  dom.phaseBanner.classList.add("is-active");
+  setTimeout(() => {
+    if (state.phaseBannerToken !== token) return;
+    dom.phaseBanner.classList.remove("is-active");
+    dom.phaseBanner.classList.add("hidden");
+  }, durationMs);
+}
+
+function showCallout(message, warn = false, durationMs = 1800) {
+  if (!message) return;
+  const token = Date.now() + Math.floor(Math.random() * 10000);
+  state.calloutToken = token;
+  state.calloutUntil = Date.now() + durationMs;
+  dom.calloutToast.textContent = message;
+  dom.calloutToast.classList.toggle("warn", Boolean(warn));
+  dom.calloutToast.classList.remove("hidden");
+  dom.calloutToast.classList.remove("is-active");
+  void dom.calloutToast.offsetWidth;
+  dom.calloutToast.classList.add("is-active");
+  setTimeout(() => {
+    if (state.calloutToken !== token) return;
+    dom.calloutToast.classList.remove("is-active");
+    dom.calloutToast.classList.add("hidden");
+  }, durationMs);
+}
+
+function spawnConfettiBursts(count = 56) {
+  dom.confettiLayer.innerHTML = "";
+  const palette = ["#27c7c2", "#ffb154", "#7ed8ff", "#ffd2d2", "#fff0a8"];
+  const total = Math.max(10, Math.min(220, Number(count) || 0));
+  for (let i = 0; i < total; i += 1) {
+    const piece = document.createElement("span");
+    piece.className = "confetti-piece";
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.background = palette[i % palette.length];
+    piece.style.setProperty("--dx", `${Math.round((Math.random() - 0.5) * 240)}px`);
+    piece.style.setProperty("--spin", `${Math.round((Math.random() - 0.5) * 900)}deg`);
+    piece.style.animationDelay = `${(i % 20) * 20}ms`;
+    piece.style.animationDuration = `${1200 + Math.floor(Math.random() * 900)}ms`;
+    dom.confettiLayer.appendChild(piece);
+  }
+  setTimeout(() => {
+    dom.confettiLayer.innerHTML = "";
+  }, 2600);
+}
+
+function inferPromptMutationKind(previousPrompt, nextPrompt) {
+  const beforeCount = String(previousPrompt || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const afterCount = String(nextPrompt || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  if (afterCount > beforeCount) return "decoy";
+  if (afterCount < beforeCount) return "erase";
+  return "scramble";
+}
+
+function triggerPromptMutationFx(kind) {
+  if (!dom.promptSide) return;
+  dom.promptSide.classList.remove("fx-erase", "fx-scramble", "fx-decoy");
+  if (kind === "erase" || kind === "scramble" || kind === "decoy") {
+    dom.promptSide.classList.add(`fx-${kind}`);
+    setTimeout(() => {
+      dom.promptSide.classList.remove(`fx-${kind}`);
+    }, 1300);
+  }
+  playSabotageFxSound(kind);
+}
+
+function triggerBlackoutFx() {
+  if (!dom.referenceWrap) return;
+  dom.referenceWrap.classList.remove("fx-blackout");
+  void dom.referenceWrap.offsetWidth;
+  dom.referenceWrap.classList.add("fx-blackout");
+  setTimeout(() => {
+    dom.referenceWrap.classList.remove("fx-blackout");
+  }, 1400);
+  playSabotageFxSound("blackout");
+}
+
+function urgencyStage(seconds) {
+  const safe = Math.max(0, Number(seconds) || 0);
+  if (safe <= 10) return "critical";
+  if (safe <= 30) return "urgent";
+  return "";
+}
+
+function applyTimerUrgency(timerNode, stage) {
+  if (!timerNode) return;
+  timerNode.classList.toggle("is-urgent", stage === "urgent");
+  timerNode.classList.toggle("is-critical", stage === "critical");
+}
+
+function applyPromptUrgency(stage) {
+  if (!dom.promptLayout) return;
+  dom.promptLayout.classList.toggle("is-urgent", stage === "urgent");
+  dom.promptLayout.classList.toggle("is-critical", stage === "critical");
+}
+
+function applyVoteUrgency(stage) {
+  dom.voteGallery.classList.toggle("is-urgent", stage === "urgent");
+  dom.voteGallery.classList.toggle("is-critical", stage === "critical");
+}
+
+function handleRoundTickFx(seconds) {
+  const stage = urgencyStage(seconds);
+  if (stage !== state.roundUrgencyStage) {
+    state.roundUrgencyStage = stage;
+    state.roundLastBeepSecond = -1;
+    if (stage === "urgent") {
+      playCountdownBeep("warn");
+      showCallout("30 seconds left. Panic with intent.");
+    } else if (stage === "critical") {
+      playCountdownBeep("critical");
+      showCallout("Final 10 seconds. Lock in now.", true);
+    }
+  }
+
+  if (
+    stage === "critical" &&
+    Number.isFinite(seconds) &&
+    seconds > 0 &&
+    seconds <= 10 &&
+    state.roundLastBeepSecond !== seconds
+  ) {
+    state.roundLastBeepSecond = seconds;
+    playCountdownBeep("critical");
+  }
+}
+
+function handleVoteTickFx(seconds) {
+  const stage = urgencyStage(seconds);
+  if (stage !== state.voteUrgencyStage) {
+    state.voteUrgencyStage = stage;
+    state.voteLastBeepSecond = -1;
+    if (stage === "urgent") {
+      playCountdownBeep("warn");
+      showCallout("30 seconds left to vote.");
+    } else if (stage === "critical") {
+      playCountdownBeep("critical");
+      showCallout("Final 10 seconds to vote.", true);
+    }
+  }
+
+  if (
+    stage === "critical" &&
+    Number.isFinite(seconds) &&
+    seconds > 0 &&
+    seconds <= 10 &&
+    state.voteLastBeepSecond !== seconds
+  ) {
+    state.voteLastBeepSecond = seconds;
+    playCountdownBeep("critical");
+  }
+}
+
+function handlePhaseTransition(prevPhase, nextPhase) {
+  if (!nextPhase || prevPhase === nextPhase) return;
+  const dedupeKey = `${prevPhase || "-"}>${nextPhase}`;
+  const now = Date.now();
+  if (state.lastPhaseFxPhase === dedupeKey && now - state.lastPhaseFxAt < 850) return;
+  state.lastPhaseFxPhase = dedupeKey;
+  state.lastPhaseFxAt = now;
+
+  const meta = PHASE_BANNER_META[nextPhase];
+  if (meta && prevPhase) {
+    const duration = nextPhase === "showcase" ? 2200 : 1700;
+    showPhaseBanner(meta.title, meta.subtitle, duration);
+  }
+
+  playPhaseStinger(nextPhase);
+  applyAmbientForPhase(nextPhase);
+
+  if (nextPhase === "round") {
+    showCallout("Prompts live. Sabotage window open.");
+  } else if (nextPhase === "showcase") {
+    showCallout("Curtain up. Anonymous slop cinema begins.");
+  } else if (nextPhase === "voting") {
+    showCallout("Voting is open. One vote only.");
+  } else if (nextPhase === "intermission") {
+    showCallout("Round complete. Waiting for all players to ready.");
+  }
+}
+
+function updateMomentumFromRoundResult(payload) {
+  const leaderboard = Array.isArray(payload?.leaderboard) ? payload.leaderboard : [];
+  const nextScores = {};
+  leaderboard.forEach((player) => {
+    nextScores[player.id] = Number(player.score) || 0;
+  });
+
+  const winners = new Set(Array.isArray(payload?.winnerIds) ? payload.winnerIds : []);
+  if (payload?.tie) {
+    state.winStreakByPlayerId = {};
+  } else if (winners.size > 0) {
+    const nextStreaks = { ...state.winStreakByPlayerId };
+    Object.keys(nextScores).forEach((playerId) => {
+      if (winners.has(playerId)) {
+        nextStreaks[playerId] = (nextStreaks[playerId] || 0) + 1;
+      } else {
+        nextStreaks[playerId] = 0;
+      }
+    });
+    state.winStreakByPlayerId = nextStreaks;
+
+    const streakLeader = [...winners]
+      .map((id) => ({
+        id,
+        streak: Number(state.winStreakByPlayerId[id]) || 0,
+        player: playerById(id)
+      }))
+      .sort((a, b) => b.streak - a.streak)[0];
+
+    if (streakLeader && streakLeader.streak >= 2) {
+      showCallout(`${streakLeader.player?.name || "A player"} is on a ${streakLeader.streak}-round streak!`, true, 2200);
+    }
+  }
+
+  state.scoreByPlayerId = nextScores;
+
+  const leader = leaderboard
+    .map((entry) => ({ ...entry, score: Number(entry.score) || 0 }))
+    .sort((a, b) => b.score - a.score)[0];
+  const toWin = Number(state.room?.toWin) || 5;
+  if (leader && leader.score === toWin - 1) {
+    const leaderName = playerById(leader.id)?.name || leader.name || "A player";
+    showCallout(`${leaderName} is on match point.`, true, 2200);
+  }
 }
 
 function sortedPlayers() {
@@ -571,7 +1104,7 @@ function renderModeOptions() {
   modes.forEach((mode) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "mode-option";
+    button.className = "mode-option tilt-card";
     if (mode.id === selectedModeId) {
       button.classList.add("selected");
     }
@@ -795,7 +1328,7 @@ function renderLobby() {
   dom.lobbyPlayersGrid.innerHTML = "";
   state.room.players.forEach((player) => {
     const card = document.createElement("article");
-    card.className = "player-card";
+    card.className = "player-card tilt-card";
     if (player.id === state.room.hostId) card.classList.add("host");
     if (player.id === state.room.self.id) card.classList.add("self");
 
@@ -819,7 +1352,7 @@ function renderLobby() {
 
   for (let i = state.room.players.length; i < MAX_PLAYERS; i += 1) {
     const empty = document.createElement("article");
-    empty.className = "player-card player-empty";
+    empty.className = "player-card player-empty tilt-card";
     empty.textContent = "Open slot";
     dom.lobbyPlayersGrid.appendChild(empty);
   }
@@ -979,7 +1512,7 @@ function renderPowerups() {
   grouped.forEach((powerup) => {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "powerup-btn";
+    btn.className = "powerup-btn tilt-card";
 
     const name = document.createElement("div");
     name.className = "powerup-name";
@@ -1021,6 +1554,11 @@ function renderPrompt() {
   dom.timerLabel.textContent = formatTimer(state.roundSeconds);
   dom.phaseLabel.textContent = phaseLabel(state.room.phase);
   dom.referenceTitle.textContent = humanityMode ? "Black Card Prompt" : "Target Reference";
+
+  const roundStage =
+    state.room.phase === "round" ? urgencyStage(state.roundSeconds) : "";
+  applyTimerUrgency(dom.timerLabel, roundStage);
+  applyPromptUrgency(roundStage);
 
   const submittedCount = state.room.players.filter((p) => p.submitted).length;
   dom.promptStatus.textContent = `${submittedCount}/${state.room.players.length} submitted`;
@@ -1065,6 +1603,9 @@ function renderPrompt() {
   renderPowerups();
   renderPromptScoreboard();
   updateBlackoutOverlay();
+
+  const clutch = roundStage === "critical" && state.room.phase === "round" && !self.submitted;
+  dom.sabotageToast.classList.toggle("is-clutch", clutch);
 }
 
 function showcaseProgress() {
@@ -1160,6 +1701,16 @@ function renderShowcase() {
   if (progress.stageKey !== state.showcaseStageKey) {
     state.showcaseStageKey = progress.stageKey;
     triggerShowcaseTransition();
+    if (progress.inReference) {
+      playPhaseStinger("showcase");
+    } else {
+      playTone(540, {
+        type: "triangle",
+        hold: 0.018,
+        release: 0.09,
+        level: 0.2
+      });
+    }
   }
 
   dom.showcaseTimerLabel.textContent = formatTimer(Math.ceil(progress.remainingMs / 1000));
@@ -1210,7 +1761,7 @@ function renderShowcase() {
 function buildVoteCard(submission, entryNumber, selfId, canVote) {
   const entryLabel = `Entry ${entryNumber}`;
   const card = document.createElement("article");
-  card.className = "vote-card";
+  card.className = "vote-card tilt-card";
 
   const img = document.createElement("img");
   img.className = "vote-image";
@@ -1294,6 +1845,9 @@ function renderVote() {
   if (!state.room) return;
 
   dom.voteTimerLabel.textContent = formatTimer(state.voteSeconds);
+  const voteStage = state.room.phase === "voting" ? urgencyStage(state.voteSeconds) : "";
+  applyTimerUrgency(dom.voteTimerLabel, voteStage);
+  applyVoteUrgency(voteStage);
   dom.voteGallery.innerHTML = "";
 
   const reveal = state.reveal || (state.result ? {
@@ -1315,7 +1869,7 @@ function renderVote() {
 
   if (!promptOnly) {
     const refCard = document.createElement("article");
-    refCard.className = "vote-card reference";
+    refCard.className = "vote-card reference tilt-card";
 
     const refImg = document.createElement("img");
     refImg.className = "vote-image";
@@ -1397,6 +1951,10 @@ function renderResults() {
   const winner = (roundWinnerId && board.find((player) => player.id === roundWinnerId)) || board[0] || null;
   const runner = (roundRunnerId && board.find((player) => player.id === roundRunnerId)) || board[1] || null;
   const winnerSubmission = submissions.find((sub) => sub.playerId === winner?.id);
+  const hasRoundWinner = Boolean(winner && !state.result?.tie);
+  if (dom.winnerCard) {
+    dom.winnerCard.classList.toggle("is-celebrating", hasRoundWinner);
+  }
 
   if (state.room.phase === "ended") {
     dom.resultTitle.textContent = "Match Complete";
@@ -1557,6 +2115,11 @@ function renderAll() {
   if (!state.room) {
     closePowerupTargetMenu();
     setVisibleScreen("auth");
+    if (!state.soundEnabled) {
+      stopAmbientLoop();
+    } else {
+      applyAmbientForPhase("lobby");
+    }
     renderLoading();
     return;
   }
@@ -1572,6 +2135,11 @@ function renderAll() {
   if (state.room.phase !== "round") {
     closePowerupTargetMenu();
   }
+  if (state.soundEnabled) {
+    applyAmbientForPhase(state.room.phase);
+  } else {
+    stopAmbientLoop();
+  }
   renderLoading();
 }
 
@@ -1586,9 +2154,54 @@ function resetRoundTransientState() {
     totalVotes: 0,
     requiredVotes: 0
   };
+  state.roundUrgencyStage = "";
+  state.voteUrgencyStage = "";
+  state.roundLastBeepSecond = -1;
+  state.voteLastBeepSecond = -1;
 }
 
 // UI handlers
+
+try {
+  state.soundEnabled = window.localStorage.getItem("psa-sound-enabled") === "1";
+} catch {
+  state.soundEnabled = false;
+}
+updateSoundToggleUi();
+
+dom.soundToggleBtn.addEventListener("click", () => {
+  if (state.soundEnabled) {
+    playUiClick();
+  }
+  setSoundEnabled(!state.soundEnabled);
+});
+
+document.addEventListener("pointerdown", () => {
+  if (!state.soundEnabled || audioEngine.unlocked) return;
+  unlockAudio().then((ok) => {
+    if (!ok) return;
+    applyAmbientForPhase(state.room?.phase || "lobby");
+  });
+});
+
+document.addEventListener("keydown", () => {
+  if (!state.soundEnabled || audioEngine.unlocked) return;
+  unlockAudio().then((ok) => {
+    if (!ok) return;
+    applyAmbientForPhase(state.room?.phase || "lobby");
+  });
+});
+
+document.addEventListener("click", (event) => {
+  if (!state.soundEnabled) return;
+  if (!(event.target instanceof Element)) return;
+  const interactive = event.target.closest(
+    "button, .vote-image, .avatar-option, .mode-option, .target-option"
+  );
+  if (!interactive || interactive.id === "soundToggleBtn") return;
+  if (interactive instanceof HTMLButtonElement && interactive.disabled) return;
+  playUiClick();
+});
 
 dom.createBtn.addEventListener("click", () => {
   const name = dom.nameInput.value.trim();
@@ -1724,11 +2337,17 @@ socket.on("roomSnapshot", (payload) => {
     state.reference.url = "";
   }
 
+  handlePhaseTransition(prevPhase, payload?.phase);
+
   renderAll();
 });
 
 socket.on("roundStarted", (payload) => {
+  const prevPhase = state.room?.phase;
   resetRoundTransientState();
+  if (state.room) {
+    state.room.phase = "round";
+  }
 
   state.reference.url = payload.referenceUrl;
   if (payload.promptVisible) {
@@ -1737,9 +2356,12 @@ socket.on("roundStarted", (payload) => {
     state.reference.promptLabel = "Reference prompt hidden until round end.";
   }
   state.roundSeconds = Number(payload.seconds) || 120;
+  handleRoundTickFx(state.roundSeconds);
+  handlePhaseTransition(prevPhase, "round");
 
   if (payload.chaosRound) {
     pushFeed("Chaos tiebreaker round started. Double powerups granted.", true);
+    showCallout("Chaos round active: double powerups.", true, 2200);
   }
 
   const grants = payload.grants || {};
@@ -1753,24 +2375,41 @@ socket.on("roundStarted", (payload) => {
 
 socket.on("roundTick", (payload) => {
   state.roundSeconds = Number(payload.seconds) || 0;
+  if (state.room?.phase === "round") {
+    handleRoundTickFx(state.roundSeconds);
+  }
   if (state.room?.phase === "round" || state.room?.phase === "generating") {
     renderPrompt();
   }
 });
 
 socket.on("generationStarted", () => {
+  const prevPhase = state.room?.phase;
+  if (state.room) {
+    state.room.phase = "generating";
+  }
+  state.roundUrgencyStage = "";
+  state.roundLastBeepSecond = -1;
   pushFeed("Generating images...");
+  handlePhaseTransition(prevPhase, "generating");
 });
 
 socket.on("promptPatched", (payload) => {
   if (!state.room || !state.room.self) return;
+  const previousPrompt = state.room.self.prompt || "";
   state.room.self.prompt = payload.prompt || "";
   dom.promptInput.value = state.room.self.prompt;
   dom.charCount.textContent = `${dom.promptInput.value.length}/${MAX_PROMPT_CHARS}`;
+  if (previousPrompt !== state.room.self.prompt) {
+    const kind = inferPromptMutationKind(previousPrompt, state.room.self.prompt);
+    triggerPromptMutationFx(kind);
+    state.lastPromptMutationAt = Date.now();
+  }
 });
 
 socket.on("blackoutApplied", (payload) => {
   state.blackoutUntil = payload.until || 0;
+  triggerBlackoutFx();
   updateBlackoutOverlay();
 });
 
@@ -1778,6 +2417,7 @@ socket.on("sabotageNotice", (payload) => {
   state.sabotageMessage = payload.message || "You were sabotaged.";
   state.sabotageUntil = Date.now() + 3200;
   pushFeed(state.sabotageMessage, true);
+  showCallout(state.sabotageMessage, true, 1800);
   updateSabotageToast();
 });
 
@@ -1797,15 +2437,18 @@ socket.on("revealReady", (payload) => {
 });
 
 socket.on("showcasePhase", (payload) => {
+  const prevPhase = state.room?.phase;
   state.showcase = payload || null;
   state.showcaseStageKey = "";
   if (state.room) {
     state.room.phase = "showcase";
   }
+  handlePhaseTransition(prevPhase, "showcase");
   renderAll();
 });
 
 socket.on("votePhase", (payload) => {
+  const prevPhase = state.room?.phase;
   if (state.room) {
     state.room.phase = "voting";
   }
@@ -1822,6 +2465,10 @@ socket.on("votePhase", (payload) => {
   state.showcase = null;
   state.showcaseStageKey = "";
   state.voteSeconds = Number(payload.seconds) || 120;
+  state.voteUrgencyStage = "";
+  state.voteLastBeepSecond = -1;
+  handleVoteTickFx(state.voteSeconds);
+  handlePhaseTransition(prevPhase, "voting");
   state.voteProgress = {
     totalVotes: 0,
     requiredVotes: payload.requiredVotes || state.room?.players?.length || 0
@@ -1833,6 +2480,7 @@ socket.on("votePhase", (payload) => {
 
 socket.on("voteTick", (payload) => {
   state.voteSeconds = Number(payload.seconds) || 0;
+  handleVoteTickFx(state.voteSeconds);
   if (state.room?.phase === "voting") {
     renderVote();
   }
@@ -1843,6 +2491,12 @@ socket.on("voteUpdate", (payload) => {
     totalVotes: payload.totalVotes || 0,
     requiredVotes: payload.requiredVotes || 0
   };
+  if (
+    state.voteProgress.requiredVotes > 0 &&
+    state.voteProgress.totalVotes >= state.voteProgress.requiredVotes
+  ) {
+    showCallout("All votes are in. Locking results...");
+  }
   if (state.room?.phase === "voting") {
     renderVote();
   }
@@ -1862,15 +2516,23 @@ socket.on("roundResult", (payload) => {
   if (payload.tie) {
     const tieLabel = isHumanityMode() ? "Tiebreaker queued." : "Chaos tiebreaker queued.";
     pushFeed(`Round tied (${payload.reason}). ${tieLabel}`, true);
+    showCallout(`Round tied (${payload.reason}).`, true);
   } else {
     const winner = payload.leaderboard.find((player) => payload.winnerIds.includes(player.id));
     pushFeed(`Round winner: ${winner ? winner.name : "Unknown"}.`);
+    if (winner) {
+      showCallout(`${winner.name} wins the round.`);
+      spawnConfettiBursts(72);
+    }
   }
+
+  updateMomentumFromRoundResult(payload);
 
   renderAll();
 });
 
 socket.on("readyUpStarted", (payload) => {
+  const prevPhase = state.room?.phase;
   if (state.room && state.room.phase !== "ended") {
     state.room.phase = "intermission";
   }
@@ -1881,10 +2543,12 @@ socket.on("readyUpStarted", (payload) => {
   } else {
     pushFeed("Round complete. Click ready when you want to continue.");
   }
+  handlePhaseTransition(prevPhase, "intermission");
   renderAll();
 });
 
 socket.on("matchEnded", (payload) => {
+  const prevPhase = state.room?.phase;
   pushFeed("Match ended.");
   state.showcase = null;
   state.showcaseStageKey = "";
@@ -1904,6 +2568,14 @@ socket.on("matchEnded", (payload) => {
       }
     };
   }
+
+  const winners = Array.isArray(payload?.winnerIds) ? payload.winnerIds : [];
+  if (winners.length) {
+    spawnConfettiBursts(120);
+    const winnerName = playerById(winners[0])?.name || "Winner";
+    showCallout(`${winnerName} wins the match!`, false, 2600);
+  }
+  handlePhaseTransition(prevPhase, "ended");
 
   renderAll();
 });
