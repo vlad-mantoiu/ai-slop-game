@@ -93,6 +93,17 @@
               <h4>Host Credits</h4>
               <p id="creditBalance" class="credit-balance">$0.00</p>
               <p id="creditMeta" class="muted small"></p>
+              <p id="authStatus" class="muted small"></p>
+              <div id="authGate" class="auth-gate hidden">
+                <input id="authEmail" type="email" placeholder="Email" />
+                <input id="authPassword" type="password" placeholder="Password (min 8 chars)" />
+                <div class="row">
+                  <button id="authLoginBtn" class="btn" type="button">Log In</button>
+                  <button id="authRegisterBtn" class="btn btn-primary" type="button">Create Account</button>
+                </div>
+                <p id="authGateStatus" class="muted small"></p>
+              </div>
+              <button id="authLogoutBtn" class="btn hidden" type="button">Switch To Guest</button>
               <div id="creditPacks" class="credit-packs"></div>
             </article>
           </aside>

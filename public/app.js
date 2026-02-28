@@ -35,9 +35,17 @@ const state = {
     spentCents: 0,
     imageCostCents: 2,
     freePlayCents: 100,
+    requiresLoginForCheckout: true,
     packs: [],
     stripeEnabled: false
   },
+  auth: {
+    loggedIn: false,
+    email: ""
+  },
+  authGateVisible: false,
+  authBusy: false,
+  pendingCheckoutPackId: "",
   feed: [],
   inputDebounce: null
 };
@@ -76,6 +84,14 @@ const dom = {
   lobbyScoreboard: document.getElementById("lobbyScoreboard"),
   creditBalance: document.getElementById("creditBalance"),
   creditMeta: document.getElementById("creditMeta"),
+  authStatus: document.getElementById("authStatus"),
+  authGate: document.getElementById("authGate"),
+  authEmail: document.getElementById("authEmail"),
+  authPassword: document.getElementById("authPassword"),
+  authGateStatus: document.getElementById("authGateStatus"),
+  authLoginBtn: document.getElementById("authLoginBtn"),
+  authRegisterBtn: document.getElementById("authRegisterBtn"),
+  authLogoutBtn: document.getElementById("authLogoutBtn"),
   creditPacks: document.getElementById("creditPacks"),
 
   roundLabel: document.getElementById("roundLabel"),
@@ -169,6 +185,26 @@ function syncBilling(payload) {
   if (!incoming || typeof incoming !== "object") return;
   state.billing = {
     ...state.billing,
+    ...incoming
+  };
+}
+
+function syncAuth(payload) {
+  const direct = payload && typeof payload === "object" ? payload : null;
+  const incoming =
+    direct && typeof direct.auth === "object"
+      ? direct.auth
+      : direct && Object.prototype.hasOwnProperty.call(direct, "loggedIn")
+      ? direct
+      : direct && Object.prototype.hasOwnProperty.call(direct, "authType")
+      ? {
+          loggedIn: String(direct.authType || "") === "user",
+          email: String(direct.email || "")
+        }
+      : null;
+  if (!incoming || typeof incoming !== "object") return;
+  state.auth = {
+    ...state.auth,
     ...incoming
   };
 }
@@ -376,9 +412,43 @@ async function refreshBillingFromApi() {
     if (!response.ok) return;
     const json = await response.json();
     syncBilling(json);
+    syncAuth(json);
     renderAll();
   } catch {
     // ignore transient billing refresh errors
+  }
+}
+
+async function refreshAuthFromApi() {
+  try {
+    const response = await fetch("/api/auth/me");
+    if (!response.ok) return;
+    const json = await response.json();
+    syncAuth(json);
+    syncBilling(json);
+    renderAll();
+  } catch {
+    // ignore transient auth refresh errors
+  }
+}
+
+async function bindCurrentSocketAccount() {
+  if (!socket?.id) return;
+  try {
+    const response = await fetch("/api/auth/bind-socket", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ socketId: socket.id })
+    });
+    if (!response.ok) return;
+    const json = await response.json();
+    syncAuth(json);
+    syncBilling(json);
+    renderAll();
+  } catch {
+    // ignore transient binding errors
   }
 }
 
@@ -507,8 +577,97 @@ function renderModeOptions() {
   }
 }
 
+function setAuthGateStatus(message, warn = false) {
+  dom.authGateStatus.textContent = message || "";
+  dom.authGateStatus.classList.toggle("warn", Boolean(warn));
+}
+
+function showAuthGate(message = "") {
+  state.authGateVisible = true;
+  setAuthGateStatus(message, false);
+  renderBillingPanel();
+}
+
+function hideAuthGate() {
+  state.authGateVisible = false;
+  setAuthGateStatus("", false);
+  renderBillingPanel();
+}
+
+async function submitAuth(mode) {
+  if (state.authBusy) return;
+  const email = dom.authEmail.value.trim();
+  const password = dom.authPassword.value;
+  const endpoint = mode === "register" ? "/api/auth/register" : "/api/auth/login";
+  state.authBusy = true;
+  setAuthGateStatus(mode === "register" ? "Creating account..." : "Logging in...", false);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, password })
+    });
+    const json = await response.json();
+    if (!response.ok) {
+      throw new Error(json?.error || "Auth failed.");
+    }
+    syncAuth(json);
+    syncBilling(json);
+    await bindCurrentSocketAccount();
+    setAuthGateStatus("Authenticated. Continuing...", false);
+    state.authGateVisible = false;
+    renderAll();
+
+    const pendingPack = state.pendingCheckoutPackId;
+    state.pendingCheckoutPackId = "";
+    if (pendingPack) {
+      await startCheckout(pendingPack);
+    }
+  } catch (error) {
+    setAuthGateStatus(String(error?.message || error || "Auth failed."), true);
+  } finally {
+    state.authBusy = false;
+    renderBillingPanel();
+  }
+}
+
+async function switchToGuest() {
+  if (state.authBusy) return;
+  state.authBusy = true;
+  try {
+    const response = await fetch("/api/auth/logout", {
+      method: "POST"
+    });
+    const json = await response.json();
+    if (!response.ok) {
+      throw new Error(json?.error || "Unable to switch to guest.");
+    }
+    syncAuth(json);
+    syncBilling(json);
+    await bindCurrentSocketAccount();
+    state.pendingCheckoutPackId = "";
+    hideAuthGate();
+    pushFeed("Switched to guest mode.");
+  } catch (error) {
+    pushFeed(String(error?.message || error || "Unable to switch to guest."), true);
+  } finally {
+    state.authBusy = false;
+    renderAll();
+  }
+}
+
 async function startCheckout(packId) {
   try {
+    const billing = selfBilling();
+    const requiresLogin = Boolean(billing?.requiresLoginForCheckout);
+    if (requiresLogin && !state.auth.loggedIn) {
+      state.pendingCheckoutPackId = packId;
+      showAuthGate("Log in or create an account to purchase credits.");
+      return;
+    }
+
     const response = await fetch("/api/billing/checkout", {
       method: "POST",
       headers: {
@@ -518,6 +677,11 @@ async function startCheckout(packId) {
     });
     const json = await response.json();
     if (!response.ok) {
+      if (json?.authRequired) {
+        state.pendingCheckoutPackId = packId;
+        showAuthGate("Log in to continue to checkout.");
+        return;
+      }
       throw new Error(json?.error || "Unable to create checkout session.");
     }
     if (!json?.checkoutUrl) {
@@ -535,6 +699,7 @@ function renderBillingPanel() {
   const roundCost = Number(state.room?.roundCostCents) || 0;
   const imageCost = Number(billing?.imageCostCents) || 0;
   const imagesPerRound = Number(state.room?.roundImageCount) || 0;
+  const requiresLogin = Boolean(billing?.requiresLoginForCheckout);
 
   dom.creditBalance.textContent = formatMoney(balanceCents);
   let note = `Next round cost ${formatMoney(roundCost)} (${imagesPerRound} images @ ${formatMoney(imageCost)} each).`;
@@ -542,6 +707,17 @@ function renderBillingPanel() {
     note += " Top-ups are not configured yet.";
   }
   dom.creditMeta.textContent = note;
+  dom.authStatus.textContent = state.auth.loggedIn
+    ? `Signed in as ${state.auth.email || "account"}`
+    : requiresLogin
+    ? "Guest mode active. Login required only for purchases."
+    : "Guest purchases are enabled.";
+  dom.authGate.classList.toggle("hidden", !state.authGateVisible);
+  dom.authEmail.disabled = state.authBusy;
+  dom.authPassword.disabled = state.authBusy;
+  dom.authLoginBtn.disabled = state.authBusy;
+  dom.authRegisterBtn.disabled = state.authBusy;
+  dom.authLogoutBtn.classList.toggle("hidden", !state.auth.loggedIn);
 
   dom.creditPacks.innerHTML = "";
   const packs = Array.isArray(billing?.packs) ? billing.packs : [];
@@ -557,7 +733,7 @@ function renderBillingPanel() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn";
-    btn.disabled = !billing.stripeEnabled;
+    btn.disabled = !billing.stripeEnabled || state.authBusy;
     btn.textContent = `${pack.label} (+${formatMoney(pack.creditCents)})`;
     btn.addEventListener("click", () => {
       startCheckout(pack.id);
@@ -1411,6 +1587,18 @@ dom.backToLobbyBtn.addEventListener("click", () => {
   socket.emit("backToLobby");
 });
 
+dom.authLoginBtn.addEventListener("click", () => {
+  submitAuth("login");
+});
+
+dom.authRegisterBtn.addEventListener("click", () => {
+  submitAuth("register");
+});
+
+dom.authLogoutBtn.addEventListener("click", () => {
+  switchToGuest();
+});
+
 dom.promptInput.addEventListener("input", () => {
   dom.charCount.textContent = `${dom.promptInput.value.length}/${MAX_PROMPT_CHARS}`;
 
@@ -1456,6 +1644,10 @@ dom.imageLightbox.addEventListener("click", (event) => {
 
 // Socket handlers
 
+socket.on("connect", () => {
+  bindCurrentSocketAccount();
+});
+
 socket.on("roomCreated", (payload) => {
   dom.joinCodeInput.value = payload.roomId;
   pushFeed(`Room created: ${payload.roomId}`);
@@ -1469,6 +1661,7 @@ socket.on("avatarCatalog", (payload) => {
 
 socket.on("billingSnapshot", (payload) => {
   syncBilling(payload);
+  syncAuth(payload);
   renderAll();
 });
 
@@ -1477,6 +1670,7 @@ socket.on("roomSnapshot", (payload) => {
   state.room = payload;
   state.gameModes = Array.isArray(payload?.gameModes) ? payload.gameModes : state.gameModes;
   syncBilling(payload?.self);
+  syncAuth(payload?.self);
 
   if (payload?.self?.avatarId) {
     state.pendingAvatarId = "";
@@ -1711,6 +1905,7 @@ setInterval(() => {
 
 renderFeed();
 renderAll();
+refreshAuthFromApi();
 refreshBillingFromApi();
 
 const checkoutState = new URLSearchParams(window.location.search).get("checkout");

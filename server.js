@@ -49,6 +49,8 @@ const BILLING_STORE_FILE = path.join(__dirname, "data", "billing-store.json");
 const BILLING_COOKIE_NAME = "slop_uid";
 const IMAGE_COST_CENTS = Math.max(1, Number(process.env.IMAGE_COST_CENTS || 2));
 const FREE_PLAY_CENTS = Math.max(0, Number(process.env.FREE_PLAY_CENTS || 100));
+const REQUIRE_LOGIN_FOR_CHECKOUT =
+  String(process.env.REQUIRE_LOGIN_FOR_CHECKOUT || "true").trim().toLowerCase() !== "false";
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const APP_BASE_URL = String(process.env.APP_BASE_URL || "")
@@ -181,6 +183,8 @@ function loadBillingStore() {
         parsed?.processedPayments && typeof parsed.processedPayments === "object"
           ? parsed.processedPayments
           : {},
+      authByEmail:
+        parsed?.authByEmail && typeof parsed.authByEmail === "object" ? parsed.authByEmail : {},
       ledger: Array.isArray(parsed?.ledger) ? parsed.ledger : []
     };
   } catch {
@@ -188,6 +192,7 @@ function loadBillingStore() {
       users: {},
       freeGrantIps: {},
       processedPayments: {},
+      authByEmail: {},
       ledger: []
     };
   }
@@ -229,6 +234,8 @@ function ensureBillingAccount(userId, ipRaw) {
 
     account = {
       id: accountId,
+      authType: "guest",
+      email: "",
       balanceCents: freeGrantCents,
       freeGrantCents,
       purchasedCents: 0,
@@ -244,6 +251,12 @@ function ensureBillingAccount(userId, ipRaw) {
     });
     changed = true;
   } else {
+    if (!account.authType) {
+      account.authType = "guest";
+    }
+    if (!account.email) {
+      account.email = "";
+    }
     account.lastSeenAt = Date.now();
     changed = true;
   }
@@ -258,12 +271,15 @@ function billingSnapshot(accountId) {
   const account = billingStore.users[accountId];
   return {
     accountId,
+    authType: account?.authType || "guest",
+    email: account?.email || "",
     balanceCents: Math.max(0, Number(account?.balanceCents) || 0),
     freeGrantCents: Math.max(0, Number(account?.freeGrantCents) || 0),
     purchasedCents: Math.max(0, Number(account?.purchasedCents) || 0),
     spentCents: Math.max(0, Number(account?.spentCents) || 0),
     imageCostCents: IMAGE_COST_CENTS,
     freePlayCents: FREE_PLAY_CENTS,
+    requiresLoginForCheckout: REQUIRE_LOGIN_FOR_CHECKOUT,
     packs: CREDIT_PACKS,
     stripeEnabled: Boolean(
       stripe &&
@@ -357,6 +373,68 @@ function roundCostCents(room) {
 
 function formatUsd(cents) {
   return `$${(Math.max(0, Number(cents) || 0) / 100).toFixed(2)}`;
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function validEmail(value) {
+  const email = normalizeEmail(value);
+  return /.+@.+\..+/.test(email) ? email : "";
+}
+
+function passwordHash(password, salt) {
+  return crypto.pbkdf2Sync(password, salt, 120000, 64, "sha512").toString("hex");
+}
+
+function setIdentityCookie(res, userId) {
+  const secure = process.env.NODE_ENV === "production";
+  const cookieValue = `${BILLING_COOKIE_NAME}=${encodeURIComponent(userId)}; Path=/; Max-Age=${60 * 60 * 24 * 365}; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
+  res.setHeader("Set-Cookie", cookieValue);
+}
+
+function authSnapshot(accountId) {
+  const account = billingStore.users[accountId] || {};
+  return {
+    loggedIn: account.authType === "user",
+    email: account.email || ""
+  };
+}
+
+function mergeGuestIntoUser(guestIdRaw, targetUserIdRaw) {
+  const guestId = sanitizeUserId(guestIdRaw);
+  const targetUserId = sanitizeUserId(targetUserIdRaw);
+  if (!guestId || !targetUserId || guestId === targetUserId) return;
+
+  const guest = billingStore.users[guestId];
+  const target = billingStore.users[targetUserId];
+  if (!guest || !target) return;
+  if (guest.authType === "user") return;
+  if (guest.mergedIntoUserId) return;
+
+  const transfer = Math.max(0, Number(guest.balanceCents) || 0);
+  if (transfer > 0) {
+    target.balanceCents = Math.max(0, Number(target.balanceCents) || 0) + transfer;
+    appendLedger({
+      type: "guest-merge-credit",
+      fromUserId: guestId,
+      userId: targetUserId,
+      cents: transfer
+    });
+  }
+
+  guest.balanceCents = 0;
+  guest.mergedIntoUserId = targetUserId;
+  guest.lastSeenAt = Date.now();
+  target.lastSeenAt = Date.now();
+  appendLedger({
+    type: "guest-merge",
+    fromUserId: guestId,
+    userId: targetUserId
+  });
+  persistBillingStore();
+  emitBillingToAccount(targetUserId);
 }
 
 function billingOwnerPlayer(room) {
@@ -2041,10 +2119,7 @@ function ensureRequestIdentity(req, res, next) {
   if (!userId) {
     userId = createAnonymousUserId();
   }
-
-  const secure = process.env.NODE_ENV === "production";
-  const cookieValue = `${BILLING_COOKIE_NAME}=${encodeURIComponent(userId)}; Path=/; Max-Age=${60 * 60 * 24 * 365}; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
-  res.setHeader("Set-Cookie", cookieValue);
+  setIdentityCookie(res, userId);
 
   req.billingUserId = userId;
   req.clientIp = resolveRequestIp(req);
@@ -2054,7 +2129,8 @@ function ensureRequestIdentity(req, res, next) {
 
 function billingResponse(userId) {
   return {
-    billing: billingSnapshot(userId)
+    billing: billingSnapshot(userId),
+    auth: authSnapshot(userId)
   };
 }
 
@@ -2102,6 +2178,151 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
 
 app.use(express.json({ limit: "64kb" }));
 
+app.get("/api/auth/me", (req, res) => {
+  const accountId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(accountId, req.clientIp);
+  res.json({
+    auth: authSnapshot(accountId),
+    billing: billingSnapshot(accountId)
+  });
+});
+
+app.post("/api/auth/register", (req, res) => {
+  const guestId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(guestId, req.clientIp);
+
+  const email = validEmail(req.body?.email || "");
+  const password = String(req.body?.password || "");
+  if (!email) {
+    res.status(400).json({ error: "Enter a valid email." });
+    return;
+  }
+  if (password.length < 8) {
+    res.status(400).json({ error: "Password must be at least 8 characters." });
+    return;
+  }
+  if (billingStore.authByEmail[email]) {
+    res.status(409).json({ error: "Email is already registered." });
+    return;
+  }
+
+  const userId = createAnonymousUserId();
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = passwordHash(password, salt);
+  const account = {
+    id: userId,
+    authType: "user",
+    email,
+    passwordSalt: salt,
+    passwordHash: hash,
+    balanceCents: 0,
+    freeGrantCents: 0,
+    purchasedCents: 0,
+    spentCents: 0,
+    createdAt: Date.now(),
+    lastSeenAt: Date.now()
+  };
+
+  billingStore.users[userId] = account;
+  billingStore.authByEmail[email] = userId;
+  appendLedger({
+    type: "auth-register",
+    userId,
+    email
+  });
+  persistBillingStore();
+
+  mergeGuestIntoUser(guestId, userId);
+  setIdentityCookie(res, userId);
+  emitBillingToAccount(userId);
+
+  res.json({
+    auth: authSnapshot(userId),
+    billing: billingSnapshot(userId)
+  });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const guestId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(guestId, req.clientIp);
+
+  const email = validEmail(req.body?.email || "");
+  const password = String(req.body?.password || "");
+  if (!email || !password) {
+    res.status(400).json({ error: "Email and password are required." });
+    return;
+  }
+
+  const userId = sanitizeUserId(billingStore.authByEmail[email] || "");
+  const account = billingStore.users[userId];
+  if (!account || account.authType !== "user" || !account.passwordSalt || !account.passwordHash) {
+    res.status(401).json({ error: "Invalid credentials." });
+    return;
+  }
+
+  const expected = passwordHash(password, account.passwordSalt);
+  if (expected !== account.passwordHash) {
+    res.status(401).json({ error: "Invalid credentials." });
+    return;
+  }
+
+  account.lastSeenAt = Date.now();
+  persistBillingStore();
+
+  mergeGuestIntoUser(guestId, userId);
+  setIdentityCookie(res, userId);
+  emitBillingToAccount(userId);
+
+  res.json({
+    auth: authSnapshot(userId),
+    billing: billingSnapshot(userId)
+  });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const guestId = createAnonymousUserId();
+  ensureBillingAccount(guestId, req.clientIp);
+  setIdentityCookie(res, guestId);
+  res.json({
+    auth: authSnapshot(guestId),
+    billing: billingSnapshot(guestId)
+  });
+});
+
+app.post("/api/auth/bind-socket", (req, res) => {
+  const accountId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(accountId, req.clientIp);
+
+  const socketId = String(req.body?.socketId || "").trim();
+  if (!socketId) {
+    res.status(400).json({ error: "socketId is required." });
+    return;
+  }
+
+  const sock = io.sockets.sockets.get(socketId);
+  if (!sock) {
+    res.status(404).json({ error: "Socket not found." });
+    return;
+  }
+
+  socketToAccount.set(socketId, accountId);
+  const roomId = socketToRoom.get(socketId);
+  if (roomId) {
+    const room = rooms.get(roomId);
+    const player = room?.players?.get(socketId);
+    if (player) {
+      player.accountId = accountId;
+      emitRoomSnapshot(room);
+    }
+  }
+
+  io.to(socketId).emit("billingSnapshot", billingSnapshot(accountId));
+  res.json({
+    auth: authSnapshot(accountId),
+    billing: billingSnapshot(accountId)
+  });
+});
+
 app.get("/api/billing/me", (req, res) => {
   const accountId = sanitizeUserId(req.billingUserId);
   ensureBillingAccount(accountId, req.clientIp);
@@ -2124,6 +2345,14 @@ app.post("/api/billing/checkout", async (req, res) => {
 
   const accountId = sanitizeUserId(req.billingUserId);
   ensureBillingAccount(accountId, req.clientIp);
+  const account = billingStore.users[accountId];
+  if (REQUIRE_LOGIN_FOR_CHECKOUT && account?.authType !== "user") {
+    res.status(401).json({
+      error: "Login required before checkout.",
+      authRequired: true
+    });
+    return;
+  }
 
   const packId = String(req.body?.packId || "").trim();
   const pack = CREDIT_PACK_BY_ID.get(packId);
@@ -2446,6 +2675,6 @@ server.listen(PORT, () => {
   console.log(`Black-card prompt catalog loaded: ${BLACK_CARD_PROMPT_CATALOG.length}`);
   // eslint-disable-next-line no-console
   console.log(
-    `Billing: imageCost=${IMAGE_COST_CENTS}c freePlay=${FREE_PLAY_CENTS}c packs=${CREDIT_PACKS.length} stripe=${stripe && STRIPE_WEBHOOK_SECRET && STRIPE_SUCCESS_URL && STRIPE_CANCEL_URL ? "ready" : "not-ready"}`
+    `Billing: imageCost=${IMAGE_COST_CENTS}c freePlay=${FREE_PLAY_CENTS}c packs=${CREDIT_PACKS.length} checkoutLogin=${REQUIRE_LOGIN_FOR_CHECKOUT ? "required" : "guest-allowed"} stripe=${stripe && STRIPE_WEBHOOK_SECRET && STRIPE_SUCCESS_URL && STRIPE_CANCEL_URL ? "ready" : "not-ready"}`
   );
 });

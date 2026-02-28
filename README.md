@@ -29,6 +29,8 @@ Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
 ## Credits & Billing
 
 - Host wallet is charged server-side before each round starts.
+- Guest-first flow: anyone can play instantly; login/register is required only when purchasing credits (default).
+- Login/register for checkout is local email/password auth stored in the billing store (MVP).
 - Default cost: `2` cents per generated image (`IMAGE_COST_CENTS=2`).
 - Default free trial: `100` cents once per user/IP (`FREE_PLAY_CENTS=100`).
 - Round cost formula:
@@ -53,6 +55,7 @@ Optional packs (JSON):
 
 ```bash
 export CREDIT_PACKS_JSON='[{"id":"pack_500","label":"$5.00 credits","priceCents":500,"creditCents":500}]'
+export REQUIRE_LOGIN_FOR_CHECKOUT=true
 ```
 
 ## Powerups
