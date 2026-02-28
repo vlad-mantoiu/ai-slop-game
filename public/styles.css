@@ -25,6 +25,7 @@ body {
 body {
   font-family: "Sora", "Avenir Next", sans-serif;
   color: var(--text);
+  padding-bottom: 82px;
   background:
     radial-gradient(circle at 10% 8%, rgba(39, 199, 194, 0.2), transparent 35%),
     radial-gradient(circle at 88% 0%, rgba(255, 177, 84, 0.14), transparent 30%),
@@ -252,6 +253,45 @@ textarea {
   margin-inline: auto;
   display: grid;
   gap: 12px;
+}
+
+.available-rooms-card {
+  gap: 10px;
+}
+
+.available-rooms-list {
+  display: grid;
+  gap: 8px;
+}
+
+.available-room-btn {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  padding: 10px;
+  text-align: left;
+  cursor: pointer;
+  display: grid;
+  gap: 5px;
+  transition: border-color 130ms ease, transform 130ms ease, background 130ms ease;
+}
+
+.available-room-btn:hover {
+  border-color: rgba(39, 199, 194, 0.7);
+  background: rgba(39, 199, 194, 0.08);
+  transform: translateY(-1px);
+}
+
+.available-room-title {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.available-room-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
 }
 
 .auth-actions {
@@ -1547,14 +1587,47 @@ textarea {
 }
 
 .feed-dock {
-  width: min(1200px, calc(100% - 28px));
-  margin: 0 auto 14px;
-  position: relative;
-  z-index: 1;
+  position: fixed;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  width: min(920px, calc(100% - 20px));
+  z-index: 85;
+}
+
+.activity-summary {
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 9px 12px;
+  background: rgba(8, 20, 29, 0.92);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+}
+
+.activity-summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity-summary::after {
+  content: "▾";
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.activity-dock[open] .activity-summary::after {
+  transform: rotate(180deg);
+}
+
+.activity-panel {
+  margin-top: 8px;
+  padding: 12px;
 }
 
 .feed {
-  margin-top: 6px;
   display: grid;
   gap: 6px;
   max-height: 170px;
@@ -1902,5 +1975,14 @@ textarea {
   .vote-header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .feed-dock {
+    width: calc(100% - 14px);
+    bottom: 6px;
+  }
+
+  .activity-summary {
+    padding: 8px 10px;
   }
 }

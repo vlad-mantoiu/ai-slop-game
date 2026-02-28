@@ -32,7 +32,7 @@
       <section id="authScreen" class="screen">
         <article class="card auth-card">
           <h2>Join Or Create</h2>
-          <p class="muted">2-6 players. 120s prompt rounds. First to 5 wins.</p>
+          <p class="muted">3-6 players. 120s prompt rounds. First to 5 wins.</p>
           <label class="field">
             <span>Name</span>
             <input id="nameInput" maxlength="24" placeholder="Display name" />
@@ -44,6 +44,15 @@
             <input id="joinCodeInput" maxlength="5" placeholder="Room code" />
             <button id="joinBtn" class="btn">Join</button>
           </div>
+        </article>
+
+        <article class="card auth-card available-rooms-card">
+          <div class="row between compact">
+            <h3>Available Rooms</h3>
+            <button id="refreshRoomsBtn" class="btn" type="button">Refresh</button>
+          </div>
+          <p id="availableRoomsStatus" class="muted small">Loading joinable lobbies...</p>
+          <div id="availableRoomsList" class="available-rooms-list"></div>
         </article>
       </section>
 
@@ -85,7 +94,7 @@
           <aside class="card lobby-side">
             <h3>Match Setup</h3>
             <ul class="meta-list">
-              <li><span>Players</span><strong>2-6</strong></li>
+              <li><span>Players</span><strong>3-6</strong></li>
               <li><span>Round Timer</span><strong>120s</strong></li>
               <li><span>Mode</span><strong id="metaMode">Classic Slop Battle</strong></li>
               <li><span>Win Condition</span><strong>First to 5</strong></li>
@@ -304,13 +313,15 @@
 
     <div id="confettiLayer" class="confetti-layer" aria-hidden="true"></div>
 
-    <section class="feed-dock card">
-      <div class="row between compact">
-        <h3>Activity</h3>
-        <span class="muted small">Live</span>
-      </div>
-      <ul id="feedList" class="feed"></ul>
-    </section>
+    <details class="feed-dock activity-dock">
+      <summary class="activity-summary">
+        <span>Activity</span>
+        <span class="muted small">Optional • default collapsed</span>
+      </summary>
+      <section class="card activity-panel">
+        <ul id="feedList" class="feed"></ul>
+      </section>
+    </details>
 
     <section id="loadingOverlay" class="loading-overlay hidden" aria-live="polite">
       <div class="loading-panel">

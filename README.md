@@ -1,13 +1,13 @@
 # Prompt Sabotage Arena (MVP)
 
-Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
+Realtime multiplayer web game (3-6 players) with two lobby-selectable modes:
 
 - `Classic Slop Battle`: match a hidden AI reference image while sabotaging each other.
 - `AI Slop Against Humanity`: everyone answers the same black-card prompt (no sabotage).
 
 ## MVP Rules Implemented
 
-- 2-6 players in realtime room.
+- 3-6 players in realtime room.
 - 120-second prompt phase each round.
 - 120-second voting phase each round (or earlier if all players vote).
 - All generated images reveal only when every player image is ready.

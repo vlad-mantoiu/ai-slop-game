@@ -1,6 +1,7 @@
 const socket = io();
 
 const MAX_PLAYERS = 6;
+const MIN_PLAYERS = 3;
 const MAX_PROMPT_CHARS = 320;
 
 const state = {
@@ -16,6 +17,8 @@ const state = {
   avatarCatalogLoaded: false,
   avatarCatalog: [],
   pendingAvatarId: "",
+  availableRooms: [],
+  availableRoomsLastRequestAt: 0,
   gameModes: [],
   roundSeconds: 120,
   voteSeconds: 120,
@@ -79,6 +82,9 @@ const dom = {
   roomBadge: document.getElementById("roomBadge"),
   nameInput: document.getElementById("nameInput"),
   joinCodeInput: document.getElementById("joinCodeInput"),
+  refreshRoomsBtn: document.getElementById("refreshRoomsBtn"),
+  availableRoomsList: document.getElementById("availableRoomsList"),
+  availableRoomsStatus: document.getElementById("availableRoomsStatus"),
   avatarGrid: document.getElementById("avatarGrid"),
   avatarStatus: document.getElementById("avatarStatus"),
 
@@ -977,6 +983,52 @@ function renderFeed() {
   });
 }
 
+function requestAvailableRooms(force = false) {
+  if (state.room && !force) return;
+  const now = Date.now();
+  if (!force && now - state.availableRoomsLastRequestAt < 3000) return;
+  state.availableRoomsLastRequestAt = now;
+  socket.emit("requestAvailableRooms");
+}
+
+function renderAvailableRooms() {
+  if (!dom.availableRoomsList || !dom.availableRoomsStatus) return;
+  dom.availableRoomsList.innerHTML = "";
+  const rooms = Array.isArray(state.availableRooms) ? state.availableRooms : [];
+  if (!rooms.length) {
+    dom.availableRoomsStatus.textContent = "No joinable lobbies right now.";
+    return;
+  }
+
+  dom.availableRoomsStatus.textContent = `${rooms.length} joinable lobby${rooms.length === 1 ? "" : "ies"} live now.`;
+  rooms.forEach((room) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "available-room-btn tilt-card";
+    btn.addEventListener("click", () => {
+      dom.joinCodeInput.value = room.roomId;
+      socket.emit("joinRoom", {
+        name: dom.nameInput.value.trim(),
+        roomId: room.roomId
+      });
+    });
+
+    const title = document.createElement("div");
+    title.className = "available-room-title";
+    title.textContent = `Room ${room.roomId}`;
+
+    const meta = document.createElement("div");
+    meta.className = "available-room-meta";
+    const mode = room.modeLabel || room.modeId || "Classic Slop Battle";
+    const host = room.hostName || "Host";
+    meta.textContent = `${room.playerCount}/${room.maxPlayers} players | ${mode} | Host: ${host}`;
+
+    btn.appendChild(title);
+    btn.appendChild(meta);
+    dom.availableRoomsList.appendChild(btn);
+  });
+}
+
 function setRoomBadge() {
   dom.roomBadge.textContent = state.room ? `Room ${state.room.roomId}` : "No room";
 }
@@ -1263,7 +1315,7 @@ function renderLobby() {
   const playerCount = state.room.players.length;
   if (state.room.phase === "starting") {
     dom.lobbyStatus.textContent = "Match starting...";
-  } else if (playerCount < 2) {
+  } else if (playerCount < MIN_PLAYERS) {
     dom.lobbyStatus.textContent = "Waiting for more players to join...";
   } else {
     dom.lobbyStatus.textContent = `${playerCount} players in room. Mode: ${modeMeta.label}.`;
@@ -1316,13 +1368,13 @@ function renderLobby() {
   const hostBalance = Number(selfBilling()?.balanceCents) || 0;
   const nextRoundCost = Number(state.room.roundCostCents) || 0;
   const hasFunds = hostBalance >= nextRoundCost;
-  const canStart = isHost() && playerCount >= 2 && state.room.phase !== "starting" && hasFunds;
+  const canStart = isHost() && playerCount >= MIN_PLAYERS && state.room.phase !== "starting" && hasFunds;
   dom.startBtn.disabled = !canStart;
 
   if (!isHost()) {
     dom.lobbyHint.textContent = "Only the host can start the match.";
-  } else if (playerCount < 2) {
-    dom.lobbyHint.textContent = "Need at least 2 players to begin.";
+  } else if (playerCount < MIN_PLAYERS) {
+    dom.lobbyHint.textContent = `Need at least ${MIN_PLAYERS} players to begin.`;
   } else if (!hasFunds) {
     dom.lobbyHint.textContent = `Insufficient credits. Need ${formatMoney(nextRoundCost)} to start next round.`;
   } else {
@@ -2058,6 +2110,7 @@ function renderAll() {
   setRoomBadge();
   if (!state.room) {
     closePowerupTargetMenu();
+    renderAvailableRooms();
     setVisibleScreen("auth");
     if (!state.soundEnabled) {
       stopAmbientLoop();
@@ -2188,6 +2241,12 @@ dom.authLogoutBtn.addEventListener("click", () => {
   switchToGuest();
 });
 
+if (dom.refreshRoomsBtn) {
+  dom.refreshRoomsBtn.addEventListener("click", () => {
+    requestAvailableRooms(true);
+  });
+}
+
 dom.promptInput.addEventListener("input", () => {
   dom.charCount.textContent = `${dom.promptInput.value.length}/${MAX_PROMPT_CHARS}`;
 
@@ -2237,6 +2296,7 @@ socket.on("connect", () => {
   state.boundSocketId = "";
   state.bindSocketToken = "";
   state.bindSocketTokenExpiresAt = 0;
+  requestAvailableRooms(true);
 });
 
 socket.on("bindSocketChallenge", async (payload) => {
@@ -2250,6 +2310,13 @@ socket.on("bindSocketChallenge", async (payload) => {
 socket.on("roomCreated", (payload) => {
   dom.joinCodeInput.value = payload.roomId;
   pushFeed(`Room created: ${payload.roomId}`);
+});
+
+socket.on("availableRooms", (payload) => {
+  state.availableRooms = Array.isArray(payload?.rooms) ? payload.rooms : [];
+  if (!state.room) {
+    renderAvailableRooms();
+  }
 });
 
 socket.on("avatarCatalog", (payload) => {
@@ -2550,7 +2617,10 @@ setInterval(() => {
   updateBlackoutOverlay();
   updateSabotageToast();
 
-  if (!state.room) return;
+  if (!state.room) {
+    requestAvailableRooms(false);
+    return;
+  }
 
   if ((state.room.phase === "round" || state.room.phase === "generating") && currentSelf()) {
     const currentText = `${dom.promptInput.value.length}/${MAX_PROMPT_CHARS}`;

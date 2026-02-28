@@ -14,6 +14,8 @@ const io = new Server(server);
 
 const PORT = Number(process.env.PORT || 3000);
 const TO_WIN = 5;
+const MIN_PLAYERS = 3;
+const MAX_PLAYERS = 6;
 const ROUND_SECONDS = 120;
 const VOTE_SECONDS = 120;
 const SHOWCASE_REFERENCE_SECONDS = Number(process.env.SHOWCASE_REFERENCE_SECONDS || 12);
@@ -1547,6 +1549,7 @@ function resetRoomForImageFailure(room, context, error) {
     message: `Round aborted during ${context}: ${compactError(error)}`
   });
   emitRoomSnapshot(room);
+  emitAvailableRooms();
 }
 
 async function similarityScore(referenceUrl, candidateUrl) {
@@ -1627,6 +1630,36 @@ function destroyRoomIfEmpty(room) {
   clearRoomTimers(room);
   refundPendingRoundCharge(room, "room-closed", { reason: "empty-room" });
   rooms.delete(room.id);
+  emitAvailableRooms();
+}
+
+function availableRoomsSnapshot() {
+  return [...rooms.values()]
+    .filter((room) => room.phase === "lobby" && room.players.size > 0 && room.players.size < MAX_PLAYERS)
+    .map((room) => {
+      const host = room.players.get(room.hostId) || [...room.players.values()][0] || null;
+      const modeId = validModeId(room.modeId);
+      return {
+        roomId: room.id,
+        modeId,
+        modeLabel: GAME_MODES[modeId]?.label || "Classic Slop Battle",
+        hostName: host?.name || "Host",
+        playerCount: room.players.size,
+        maxPlayers: MAX_PLAYERS
+      };
+    })
+    .sort((a, b) => b.playerCount - a.playerCount || a.roomId.localeCompare(b.roomId));
+}
+
+function emitAvailableRooms(targetSocketId = "") {
+  const payload = {
+    rooms: availableRoomsSnapshot()
+  };
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("availableRooms", payload);
+    return;
+  }
+  io.emit("availableRooms", payload);
 }
 
 function playerPublic(p, viewerId) {
@@ -1814,7 +1847,7 @@ function snippet(text) {
 }
 
 function allPlayersReady(room) {
-  if (room.players.size < 2) return false;
+  if (room.players.size < MIN_PLAYERS) return false;
   return [...room.players.values()].every((player) => player.readyForNextRound);
 }
 
@@ -1852,9 +1885,10 @@ function beginReadyUp(room) {
 }
 
 async function startRound(room) {
-  if (room.players.size < 2) {
+  if (room.players.size < MIN_PLAYERS) {
     room.phase = "lobby";
     emitRoomSnapshot(room);
+    emitAvailableRooms();
     return;
   }
 
@@ -1888,6 +1922,7 @@ async function startRound(room) {
       io.to(targetSocket).emit("errorMessage", { message });
     }
     emitRoomSnapshot(room);
+    emitAvailableRooms();
     return;
   }
 
@@ -1921,6 +1956,7 @@ async function startRound(room) {
       });
     }
     emitRoomSnapshot(room);
+    emitAvailableRooms();
     return;
   }
   reserveDailyImageAllowance(room, limitGate);
@@ -2389,6 +2425,7 @@ function createRoom(socket, name) {
 
   io.to(socket.id).emit("roomCreated", { roomId: id });
   emitRoomSnapshot(room);
+  emitAvailableRooms();
 }
 
 function joinRoom(socket, roomId, name) {
@@ -2399,7 +2436,7 @@ function joinRoom(socket, roomId, name) {
     return;
   }
 
-  if (room.players.size >= 6) {
+  if (room.players.size >= MAX_PLAYERS) {
     io.to(socket.id).emit("errorMessage", { message: "Room is full" });
     return;
   }
@@ -2424,6 +2461,7 @@ function joinRoom(socket, roomId, name) {
 
   io.to(room.id).emit("systemMessage", { message: `${player.name} joined the room.` });
   emitRoomSnapshot(room);
+  emitAvailableRooms();
 }
 
 function leaveCurrentRoom(socket) {
@@ -2447,7 +2485,7 @@ function leaveCurrentRoom(socket) {
     message: `${player ? player.name : "A player"} left the room.`
   });
 
-  if (room.players.size < 2 && room.phase !== "lobby" && room.phase !== "ended") {
+  if (room.players.size < MIN_PLAYERS && room.phase !== "lobby" && room.phase !== "ended") {
     clearRoomTimers(room);
     refundPendingRoundCharge(room, "round-cancelled", { reason: "player-left" });
     room.phase = "lobby";
@@ -2470,6 +2508,7 @@ function leaveCurrentRoom(socket) {
   }
 
   emitRoomSnapshot(room);
+  emitAvailableRooms();
   if (room.phase === "intermission") {
     maybeStartNextRound(room);
   }
@@ -3033,6 +3072,12 @@ io.on("connection", (socket) => {
   io.to(socket.id).emit("powerupCatalog", { powerups: Object.values(POWERUPS) });
   io.to(socket.id).emit("avatarCatalog", { avatars: AVATAR_CATALOG });
   io.to(socket.id).emit("billingSnapshot", billingSnapshot(accountId));
+  emitAvailableRooms(socket.id);
+
+  socket.on("requestAvailableRooms", () => {
+    if (socketRateLimited(socket, "request-rooms", 24, 30_000)) return;
+    emitAvailableRooms(socket.id);
+  });
 
   socket.on("createRoom", (payload) => {
     if (
@@ -3125,8 +3170,8 @@ io.on("connection", (socket) => {
       io.to(socket.id).emit("errorMessage", { message: "Only the host can start the game." });
       return;
     }
-    if (room.players.size < 2) {
-      io.to(socket.id).emit("errorMessage", { message: "Need at least 2 players." });
+    if (room.players.size < MIN_PLAYERS) {
+      io.to(socket.id).emit("errorMessage", { message: `Need at least ${MIN_PLAYERS} players.` });
       return;
     }
     if (room.phase !== "lobby" && room.phase !== "ended") {
@@ -3185,6 +3230,7 @@ io.on("connection", (socket) => {
     }
 
     emitRoomSnapshot(room);
+    emitAvailableRooms();
     await startRound(room);
   });
 
@@ -3317,6 +3363,7 @@ io.on("connection", (socket) => {
     }
 
     emitRoomSnapshot(room);
+    emitAvailableRooms();
   });
 
   socket.on("disconnect", () => {
