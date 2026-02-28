@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prompt Sabotage Arena</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="background-aura"></div>
+
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-icon">PS</div>
+          <div>
+            <h1>Prompt Sabotage Arena</h1>
+            <p class="subtitle">Realtime chaos prompt battles</p>
+          </div>
+        </div>
+        <div class="room-pill" id="roomBadge">No room</div>
+      </header>
+
+      <section id="authScreen" class="screen">
+        <article class="card auth-card">
+          <h2>Join Or Create</h2>
+          <p class="muted">2-6 players. 120s prompt rounds. First to 5 wins.</p>
+          <label class="field">
+            <span>Name</span>
+            <input id="nameInput" maxlength="24" placeholder="Display name" />
+          </label>
+          <div class="auth-actions">
+            <button id="createBtn" class="btn btn-primary">Create Room</button>
+          </div>
+          <div class="row split">
+            <input id="joinCodeInput" maxlength="5" placeholder="Room code" />
+            <button id="joinBtn" class="btn">Join</button>
+          </div>
+        </article>
+      </section>
+
+      <section id="avatarScreen" class="screen hidden">
+        <article class="card avatar-card">
+          <h2>Choose Your Avatar</h2>
+          <p class="muted">Pick one avatar before entering the lobby.</p>
+          <div id="avatarGrid" class="avatar-grid"></div>
+          <p id="avatarStatus" class="muted center"></p>
+        </article>
+      </section>
+
+      <section id="lobbyScreen" class="screen hidden">
+        <div class="lobby-layout">
+          <article class="card lobby-main">
+            <div class="lobby-head">
+              <div>
+                <p class="kicker">Lobby</p>
+                <h2 id="lobbyTitle">Room</h2>
+                <p class="muted" id="lobbyStatus">Waiting for players...</p>
+              </div>
+              <div class="code-chip" id="codeChip">CODE: -----</div>
+            </div>
+
+            <div id="lobbyPlayersGrid" class="players-grid"></div>
+
+            <div class="lobby-cta">
+              <button id="startBtn" class="btn btn-primary btn-large">Start Match</button>
+              <p id="lobbyHint" class="muted center"></p>
+            </div>
+          </article>
+
+          <aside class="card lobby-side">
+            <h3>Match Setup</h3>
+            <ul class="meta-list">
+              <li><span>Players</span><strong>2-6</strong></li>
+              <li><span>Round Timer</span><strong>120s</strong></li>
+              <li><span>Win Condition</span><strong>First to 5</strong></li>
+              <li><span>Tiebreaker</span><strong>Chaos + double powerups</strong></li>
+            </ul>
+            <h4>Current Scores</h4>
+            <ul id="lobbyScoreboard" class="list"></ul>
+          </aside>
+        </div>
+      </section>
+
+      <section id="promptScreen" class="screen hidden">
+        <div class="prompt-header card">
+          <div>
+            <p class="kicker">Round</p>
+            <h2 id="roundLabel">0</h2>
+          </div>
+          <div class="timer-chip" id="timerLabel">02:00</div>
+          <div class="align-right">
+            <p class="kicker">Phase</p>
+            <h2 id="phaseLabel">Prompting</h2>
+          </div>
+        </div>
+
+        <div id="sabotageToast" class="toast hidden"></div>
+
+        <div class="prompt-layout">
+          <article class="card reference-card">
+            <div class="row between compact">
+              <h3>Target Reference</h3>
+              <span id="promptStatus" class="muted"></span>
+            </div>
+            <div class="reference-wrap">
+              <img id="referenceImg" alt="Reference" />
+              <div id="blackoutOverlay" class="overlay hidden">Reference hidden by sabotage</div>
+            </div>
+            <p id="referencePrompt" class="muted small"></p>
+          </article>
+
+          <aside class="card prompt-side">
+            <h3>Your Prompt</h3>
+            <textarea id="promptInput" maxlength="320" placeholder="Describe the reference image in detail"></textarea>
+            <div class="row between compact">
+              <span class="muted small">Be specific with style, scene, and lighting.</span>
+              <span id="charCount" class="muted small">0/320</span>
+            </div>
+            <div class="row">
+              <button id="submitBtn" class="btn btn-primary">Submit</button>
+            </div>
+            <h4>Powerups</h4>
+            <div id="powerupTray" class="powerups"></div>
+          </aside>
+        </div>
+
+        <article class="card">
+          <div class="row between compact">
+            <h3>Live Scoreboard</h3>
+            <span class="muted small" id="promptPhaseNote"></span>
+          </div>
+          <ul id="scoreboardList" class="list"></ul>
+        </article>
+      </section>
+
+      <section id="showcaseScreen" class="screen hidden">
+        <article class="card showcase-header">
+          <div>
+            <p class="kicker">Cinematic Showcase</p>
+            <h2 id="showcaseStepLabel">Reference Reveal</h2>
+            <p id="showcaseStatus" class="muted">Preparing dramatic comparison...</p>
+          </div>
+          <div class="timer-chip" id="showcaseTimerLabel">00:00</div>
+        </article>
+
+        <div id="showcasePanels" class="showcase-panels">
+          <article class="card showcase-card showcase-reference">
+            <div class="showcase-title-row">
+              <h3>Reference</h3>
+            </div>
+            <div class="showcase-image-wrap">
+              <img id="showcaseReferenceImg" alt="Reference image" />
+            </div>
+            <p id="showcaseReferencePrompt" class="showcase-prompt"></p>
+          </article>
+
+          <article id="showcaseEntryCard" class="card showcase-card showcase-entry">
+            <div class="showcase-title-row">
+              <h3 id="showcaseEntryLabel">Entry</h3>
+            </div>
+            <div class="showcase-image-wrap">
+              <img id="showcaseEntryImg" alt="Entry image" />
+            </div>
+            <p id="showcaseEntryPrompt" class="showcase-prompt"></p>
+            <div class="showcase-sabotage">
+              <div class="showcase-sabotage-title">Sabotage Summary</div>
+              <ul id="showcaseSabotageList" class="showcase-sabotage-list"></ul>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="voteScreen" class="screen hidden">
+        <article class="card vote-header">
+          <div>
+            <p class="kicker">Gallery Reveal</p>
+            <h2>Vote For The Best Match</h2>
+            <p class="muted">No self-vote. One vote per player.</p>
+          </div>
+          <div class="timer-chip" id="voteTimerLabel">02:00</div>
+        </article>
+
+        <div id="voteGallery" class="vote-grid"></div>
+        <p id="voteStatus" class="center muted"></p>
+      </section>
+
+      <section id="resultsScreen" class="screen hidden">
+        <article class="card results-banner">
+          <p class="kicker">Round Complete</p>
+          <h2 id="resultTitle">Results</h2>
+          <p id="resultSubtitle" class="muted"></p>
+        </article>
+
+        <div class="results-top">
+          <article class="card winner-card">
+            <p class="kicker">Winner</p>
+            <h3 id="winnerName">-</h3>
+            <p id="winnerMetric" class="big-metric">-</p>
+          </article>
+          <article class="card runner-card">
+            <p class="kicker">Runner Up</p>
+            <h3 id="runnerName">-</h3>
+            <p id="runnerMetric" class="muted">-</p>
+          </article>
+        </div>
+
+        <article class="card winner-prompt-card">
+          <p class="kicker">Winner Prompt</p>
+          <p id="winnerPromptText" class="winner-prompt-text">Prompt will appear after winner reveal.</p>
+        </article>
+
+        <article class="card">
+          <div class="row between compact">
+            <h3>Leaderboard</h3>
+            <span class="muted small">First to 5</span>
+          </div>
+          <table class="leaderboard-table">
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Player</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody id="resultsTableBody"></tbody>
+          </table>
+        </article>
+
+        <article class="card reference-reveal">
+          <div>
+            <h3>Reference Prompt Revealed</h3>
+            <p id="resultsReferencePrompt" class="muted"></p>
+          </div>
+          <div class="thumb-wrap">
+            <img id="resultsReferenceImg" alt="Reference" />
+          </div>
+        </article>
+
+        <div class="results-actions">
+          <button id="readyNextBtn" class="btn btn-primary hidden">Ready For Next Round</button>
+          <button id="backToLobbyBtn" class="btn hidden">Back To Lobby</button>
+          <p id="intermissionLabel" class="muted"></p>
+        </div>
+      </section>
+    </main>
+
+    <section class="feed-dock card">
+      <div class="row between compact">
+        <h3>Activity</h3>
+        <span class="muted small">Live</span>
+      </div>
+      <ul id="feedList" class="feed"></ul>
+    </section>
+
+    <section id="loadingOverlay" class="loading-overlay hidden" aria-live="polite">
+      <div class="loading-panel">
+        <div class="quirk-stack" aria-hidden="true">
+          <div class="quirk-blob quirk-a"></div>
+          <div class="quirk-blob quirk-b"></div>
+          <div class="quirk-blob quirk-c"></div>
+          <div class="quirk-ring"></div>
+        </div>
+        <h3>Chaos Engine Loading...</h3>
+        <p id="loadingText" class="muted">Warming up pixel goblins...</p>
+      </div>
+    </section>
+
+    <section id="imageLightbox" class="image-lightbox hidden" aria-live="polite">
+      <button id="imageLightboxClose" class="image-lightbox-close" type="button" aria-label="Close image">
+        Close
+      </button>
+      <div class="image-lightbox-stage">
+        <img id="imageLightboxImg" alt="Expanded image" />
+        <p id="imageLightboxCaption" class="image-lightbox-caption"></p>
+      </div>
+    </section>
+
+    <div id="powerupTargetMenu" class="target-menu hidden" aria-live="polite"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
