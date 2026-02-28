@@ -46,6 +46,9 @@ const state = {
   authGateVisible: false,
   authBusy: false,
   pendingCheckoutPackId: "",
+  boundSocketId: "",
+  bindSocketToken: "",
+  bindSocketTokenExpiresAt: 0,
   feed: [],
   inputDebounce: null
 };
@@ -432,18 +435,31 @@ async function refreshAuthFromApi() {
   }
 }
 
-async function bindCurrentSocketAccount() {
+async function bindCurrentSocketAccount(force = false) {
   if (!socket?.id) return;
+  if (!force && state.boundSocketId === socket.id) return;
+  const bindToken = String(state.bindSocketToken || "");
+  if (!bindToken) return;
   try {
     const response = await fetch("/api/auth/bind-socket", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ socketId: socket.id })
+      body: JSON.stringify({
+        socketId: socket.id,
+        bindToken
+      })
     });
-    if (!response.ok) return;
+    if (!response.ok) {
+      state.boundSocketId = "";
+      return;
+    }
     const json = await response.json();
+    state.boundSocketId = socket.id;
+    if (json?.bindToken) {
+      state.bindSocketToken = String(json.bindToken);
+    }
     syncAuth(json);
     syncBilling(json);
     renderAll();
@@ -615,7 +631,7 @@ async function submitAuth(mode) {
     }
     syncAuth(json);
     syncBilling(json);
-    await bindCurrentSocketAccount();
+    await bindCurrentSocketAccount(true);
     setAuthGateStatus("Authenticated. Continuing...", false);
     state.authGateVisible = false;
     renderAll();
@@ -646,7 +662,7 @@ async function switchToGuest() {
     }
     syncAuth(json);
     syncBilling(json);
-    await bindCurrentSocketAccount();
+    await bindCurrentSocketAccount(true);
     state.pendingCheckoutPackId = "";
     hideAuthGate();
     pushFeed("Switched to guest mode.");
@@ -1645,7 +1661,17 @@ dom.imageLightbox.addEventListener("click", (event) => {
 // Socket handlers
 
 socket.on("connect", () => {
-  bindCurrentSocketAccount();
+  state.boundSocketId = "";
+  state.bindSocketToken = "";
+  state.bindSocketTokenExpiresAt = 0;
+});
+
+socket.on("bindSocketChallenge", async (payload) => {
+  const token = String(payload?.bindToken || "").trim();
+  if (!token) return;
+  state.bindSocketToken = token;
+  state.bindSocketTokenExpiresAt = Number(payload?.expiresAt) || 0;
+  await bindCurrentSocketAccount(false);
 });
 
 socket.on("roomCreated", (payload) => {
@@ -1881,6 +1907,9 @@ socket.on("billingRequired", (payload) => {
 });
 
 socket.on("disconnect", () => {
+  state.boundSocketId = "";
+  state.bindSocketToken = "";
+  state.bindSocketTokenExpiresAt = 0;
   pushFeed("Disconnected from server.", true);
 });
 

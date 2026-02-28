@@ -32,7 +32,7 @@ Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
 - Guest-first flow: anyone can play instantly; login/register is required only when purchasing credits (default).
 - Login/register for checkout is local email/password auth stored in the billing store (MVP).
 - Default cost: `2` cents per generated image (`IMAGE_COST_CENTS=2`).
-- Default free trial: `100` cents once per user/IP (`FREE_PLAY_CENTS=100`).
+- Default free trial: `100` cents once per user/IP+device fingerprint (`FREE_PLAY_CENTS=100`).
 - Round cost formula:
   - `Classic`: `(players + 1) * IMAGE_COST_CENTS` (reference + all player images)
   - `Against Humanity`: `players * IMAGE_COST_CENTS`
@@ -56,6 +56,14 @@ Optional packs (JSON):
 ```bash
 export CREDIT_PACKS_JSON='[{"id":"pack_500","label":"$5.00 credits","priceCents":500,"creditCents":500}]'
 export REQUIRE_LOGIN_FOR_CHECKOUT=true
+```
+
+Optional hardening knobs:
+
+```bash
+export TRUST_PROXY=1
+export CHECKOUT_COOLDOWN_MS=7000
+export SOCKET_BIND_TOKEN_TTL_MS=300000
 ```
 
 ## Powerups
@@ -120,4 +128,4 @@ Open `http://localhost:3000` in multiple tabs/devices.
 
 - The 2-player similarity score uses a pixel-level approximation (`sharp`) for fast MVP judging.
 - If similarity computation fails, a bounded fallback score is used so scoring can continue.
-- This is intentionally MVP-level and optimized for playable flow, not anti-cheat hardening.
+- Added lightweight anti-abuse controls: socket bind challenge tokens, route/socket rate limits, and checkout/session spam guards.

@@ -21,6 +21,18 @@ const SHOWCASE_ENTRY_SECONDS = Number(process.env.SHOWCASE_ENTRY_SECONDS || 14);
 const MAX_NAME_LEN = 24;
 const MAX_PROMPT_LEN = 320;
 const SESSION_PROMPT_POOL_SIZE = 120;
+const CHECKOUT_COOLDOWN_MS = Math.max(1000, Number(process.env.CHECKOUT_COOLDOWN_MS || 7000));
+const SOCKET_BIND_TOKEN_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.SOCKET_BIND_TOKEN_TTL_MS || 5 * 60 * 1000)
+);
+const RATE_LIMIT_STALE_MS = Math.max(
+  60_000,
+  Number(process.env.RATE_LIMIT_STALE_MS || 30 * 60 * 1000)
+);
+const TRUST_PROXY = parseTrustProxyValue(
+  process.env.TRUST_PROXY || (process.env.RAILWAY_ENVIRONMENT ? "1" : "")
+);
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_IMAGE_MODEL = String(process.env.OPENAI_IMAGE_MODEL || "gpt-image-1-mini").trim();
 const OPENAI_IMAGE_SIZE = String(process.env.OPENAI_IMAGE_SIZE || "1024x1024").trim();
@@ -85,12 +97,19 @@ const GAME_MODES = {
 const GAME_MODE_IDS = Object.keys(GAME_MODES);
 const STRIPE_CURRENCY = "usd";
 const USER_ID_PATTERN = /^[a-f0-9-]{16,64}$/i;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{16,128}$/i;
 
 const rooms = new Map();
 const socketToRoom = new Map();
 const socketToAccount = new Map();
+const socketBindChallenges = new Map();
+const httpRateBuckets = new Map();
+const socketRateBuckets = new Map();
+const socketRateWarnAt = new Map();
 const AVATAR_DIR = path.join(__dirname, "avatars");
 const AVATAR_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"]);
+
+app.set("trust proxy", TRUST_PROXY);
 
 function parseCreditPacks() {
   const raw = String(process.env.CREDIT_PACKS_JSON || "").trim();
@@ -136,9 +155,29 @@ function parseCookieHeader(header) {
   return out;
 }
 
+function parseTrustProxyValue(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || raw === "false" || raw === "0" || raw === "off" || raw === "no") {
+    return false;
+  }
+  if (raw === "true" || raw === "on" || raw === "yes") {
+    return 1;
+  }
+  if (/^\d+$/.test(raw)) {
+    return Math.max(0, Number(raw));
+  }
+  return raw;
+}
+
 function sanitizeUserId(value) {
   const v = String(value || "").trim();
   if (!USER_ID_PATTERN.test(v)) return "";
+  return v;
+}
+
+function sanitizeFingerprint(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (!FINGERPRINT_PATTERN.test(v)) return "";
   return v;
 }
 
@@ -161,15 +200,190 @@ function normalizeIp(value) {
   return ip;
 }
 
+function normalizeFingerprintPart(value, maxLen = 180) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .slice(0, maxLen);
+}
+
+function fingerprintFromHeaders(parts) {
+  const compact = parts.filter(Boolean).join("|");
+  if (!compact) return "";
+  return crypto.createHash("sha256").update(compact).digest("hex");
+}
+
 function resolveRequestIp(req) {
-  return normalizeIp(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "");
+  const fromExpress = normalizeIp(req.ip || req.socket?.remoteAddress || "");
+  if (fromExpress) return fromExpress;
+  if (TRUST_PROXY) {
+    return normalizeIp(req.headers["x-forwarded-for"] || "");
+  }
+  return "";
 }
 
 function resolveSocketIp(socket) {
-  return normalizeIp(
-    socket?.handshake?.headers?.["x-forwarded-for"] || socket?.handshake?.address || ""
+  const direct = normalizeIp(
+    socket?.request?.socket?.remoteAddress || socket?.conn?.remoteAddress || socket?.handshake?.address || ""
+  );
+  if (direct) return direct;
+  if (TRUST_PROXY) {
+    return normalizeIp(socket?.handshake?.headers?.["x-forwarded-for"] || "");
+  }
+  return "";
+}
+
+function resolveRequestFingerprint(req) {
+  return sanitizeFingerprint(
+    fingerprintFromHeaders([
+      normalizeFingerprintPart(req.headers["user-agent"]),
+      normalizeFingerprintPart(req.headers["accept-language"], 120),
+      normalizeFingerprintPart(req.headers["sec-ch-ua"], 120),
+      normalizeFingerprintPart(req.headers["sec-ch-ua-platform"], 80)
+    ])
   );
 }
+
+function resolveSocketFingerprint(socket) {
+  const headers = socket?.handshake?.headers || {};
+  return sanitizeFingerprint(
+    fingerprintFromHeaders([
+      normalizeFingerprintPart(headers["user-agent"]),
+      normalizeFingerprintPart(headers["accept-language"], 120),
+      normalizeFingerprintPart(headers["sec-ch-ua"], 120),
+      normalizeFingerprintPart(headers["sec-ch-ua-platform"], 80)
+    ])
+  );
+}
+
+function consumeRateLimit(store, key, limit, windowMs) {
+  const max = Math.max(1, Number(limit) || 1);
+  const winMs = Math.max(250, Number(windowMs) || 1000);
+  const now = Date.now();
+  const existing = store.get(key);
+  const bucket =
+    existing && now - existing.startedAt < winMs
+      ? existing
+      : {
+          startedAt: now,
+          count: 0
+        };
+
+  if (bucket.count >= max) {
+    return {
+      ok: false,
+      retryAfterMs: Math.max(0, winMs - (now - bucket.startedAt))
+    };
+  }
+
+  bucket.count += 1;
+  store.set(key, bucket);
+  return {
+    ok: true,
+    retryAfterMs: 0
+  };
+}
+
+function pruneRateBuckets(store, staleMs = RATE_LIMIT_STALE_MS) {
+  const now = Date.now();
+  for (const [key, bucket] of store.entries()) {
+    if (!bucket || now - Number(bucket.startedAt || 0) > staleMs) {
+      store.delete(key);
+    }
+  }
+}
+
+function withHttpRateLimit(scope, limit, windowMs, keySelector = null) {
+  return (req, res, next) => {
+    const ip = req.clientIp || resolveRequestIp(req) || "unknown-ip";
+    const suffix = keySelector ? String(keySelector(req) || "").trim() : "";
+    const key = suffix ? `${scope}:${ip}:${suffix}` : `${scope}:${ip}`;
+    const verdict = consumeRateLimit(httpRateBuckets, key, limit, windowMs);
+    if (verdict.ok) {
+      next();
+      return;
+    }
+
+    const retryAfterSeconds = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+    res.status(429).json({
+      error: "Too many requests. Slow down.",
+      retryAfterSeconds
+    });
+  };
+}
+
+function socketRateLimitKey(socket, scope) {
+  const accountId = sanitizeUserId(socketToAccount.get(socket.id) || "") || "guest";
+  const ip = resolveSocketIp(socket) || "unknown-ip";
+  return `${scope}:${accountId}:${ip}`;
+}
+
+function socketRateLimited(socket, scope, limit, windowMs, message) {
+  const verdict = consumeRateLimit(
+    socketRateBuckets,
+    socketRateLimitKey(socket, scope),
+    limit,
+    windowMs
+  );
+  if (verdict.ok) return false;
+
+  const now = Date.now();
+  const lastWarnAt = Number(socketRateWarnAt.get(socket.id) || 0);
+  if (now - lastWarnAt > 1200) {
+    socketRateWarnAt.set(socket.id, now);
+    io.to(socket.id).emit("errorMessage", {
+      message: message || "You are doing that too quickly. Slow down."
+    });
+  }
+  return true;
+}
+
+function createSocketBindChallenge(socketId) {
+  if (!socketId) return { token: "", expiresAt: 0 };
+  const token = crypto.randomBytes(24).toString("hex");
+  const expiresAt = Date.now() + SOCKET_BIND_TOKEN_TTL_MS;
+  socketBindChallenges.set(socketId, {
+    token,
+    expiresAt
+  });
+  return {
+    token,
+    expiresAt
+  };
+}
+
+function safeTokenMatch(a, b) {
+  const left = String(a || "");
+  const right = String(b || "");
+  if (!left || !right || left.length !== right.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(left), Buffer.from(right));
+  } catch {
+    return false;
+  }
+}
+
+function verifySocketBindChallenge(socketId, token) {
+  const record = socketBindChallenges.get(socketId);
+  if (!record) {
+    return { ok: false, reason: "missing" };
+  }
+  if (Date.now() > Number(record.expiresAt || 0)) {
+    socketBindChallenges.delete(socketId);
+    return { ok: false, reason: "expired" };
+  }
+  if (!safeTokenMatch(token, record.token)) {
+    return { ok: false, reason: "mismatch" };
+  }
+  return { ok: true };
+}
+
+setInterval(() => {
+  pruneRateBuckets(httpRateBuckets);
+  pruneRateBuckets(socketRateBuckets);
+}, 60_000).unref();
 
 function loadBillingStore() {
   try {
@@ -179,6 +393,10 @@ function loadBillingStore() {
       users: parsed?.users && typeof parsed.users === "object" ? parsed.users : {},
       freeGrantIps:
         parsed?.freeGrantIps && typeof parsed.freeGrantIps === "object" ? parsed.freeGrantIps : {},
+      freeGrantFingerprints:
+        parsed?.freeGrantFingerprints && typeof parsed.freeGrantFingerprints === "object"
+          ? parsed.freeGrantFingerprints
+          : {},
       processedPayments:
         parsed?.processedPayments && typeof parsed.processedPayments === "object"
           ? parsed.processedPayments
@@ -191,6 +409,7 @@ function loadBillingStore() {
     return {
       users: {},
       freeGrantIps: {},
+      freeGrantFingerprints: {},
       processedPayments: {},
       authByEmail: {},
       ledger: []
@@ -218,18 +437,28 @@ function appendLedger(entry) {
   }
 }
 
-function ensureBillingAccount(userId, ipRaw) {
+function ensureBillingAccount(userId, ipRaw, fingerprintRaw = "") {
   const accountId = sanitizeUserId(userId);
   if (!accountId) return null;
 
   const ip = normalizeIp(ipRaw);
+  const fingerprint = sanitizeFingerprint(fingerprintRaw);
   let changed = false;
   let account = billingStore.users[accountId];
   if (!account) {
-    const grantAllowed = ip && !billingStore.freeGrantIps[ip];
+    const ipSeen = Boolean(ip && billingStore.freeGrantIps[ip]);
+    const fingerprintSeen = Boolean(
+      fingerprint && billingStore.freeGrantFingerprints[fingerprint]
+    );
+    const grantAllowed = Boolean(ip || fingerprint) && !ipSeen && !fingerprintSeen;
     const freeGrantCents = grantAllowed ? FREE_PLAY_CENTS : 0;
     if (grantAllowed) {
-      billingStore.freeGrantIps[ip] = Date.now();
+      if (ip) {
+        billingStore.freeGrantIps[ip] = Date.now();
+      }
+      if (fingerprint) {
+        billingStore.freeGrantFingerprints[fingerprint] = Date.now();
+      }
     }
 
     account = {
@@ -240,6 +469,7 @@ function ensureBillingAccount(userId, ipRaw) {
       freeGrantCents,
       purchasedCents: 0,
       spentCents: 0,
+      checkoutLockUntil: 0,
       createdAt: Date.now(),
       lastSeenAt: Date.now()
     };
@@ -256,6 +486,9 @@ function ensureBillingAccount(userId, ipRaw) {
     }
     if (!account.email) {
       account.email = "";
+    }
+    if (!Number.isFinite(Number(account.checkoutLockUntil))) {
+      account.checkoutLockUntil = 0;
     }
     account.lastSeenAt = Date.now();
     changed = true;
@@ -2123,7 +2356,8 @@ function ensureRequestIdentity(req, res, next) {
 
   req.billingUserId = userId;
   req.clientIp = resolveRequestIp(req);
-  ensureBillingAccount(userId, req.clientIp);
+  req.clientFingerprint = resolveRequestFingerprint(req);
+  ensureBillingAccount(userId, req.clientIp, req.clientFingerprint);
   next();
 }
 
@@ -2159,17 +2393,42 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
     const accountId = sanitizeUserId(session?.metadata?.slop_user_id || "");
-    const creditCents = Math.max(0, Number(session?.metadata?.credit_cents || 0));
     const packId = String(session?.metadata?.pack_id || "");
-    if (accountId && creditCents > 0 && session?.payment_status === "paid") {
+    const pack = CREDIT_PACK_BY_ID.get(packId);
+    const creditCents = Math.max(0, Number(session?.metadata?.credit_cents || 0));
+    const amountTotal = Math.max(0, Number(session?.amount_total || 0));
+    const packMatchesMetadata = Boolean(pack && creditCents === pack.creditCents);
+    const paidEnough = !pack || amountTotal === 0 || amountTotal >= pack.priceCents;
+
+    if (
+      accountId &&
+      pack &&
+      packMatchesMetadata &&
+      paidEnough &&
+      session?.payment_status === "paid"
+    ) {
       ensureBillingAccount(accountId, "");
+      const account = billingStore.users[accountId];
+      let lockCleared = false;
+      if (account && Number(account.checkoutLockUntil || 0) > 0) {
+        account.checkoutLockUntil = 0;
+        lockCleared = true;
+      }
       const externalId = `stripe:checkout:${session.id}`;
       const credited = creditCredits(accountId, creditCents, "stripe-topup", externalId, {
-        packId
+        packId,
+        amountTotal
       });
       if (credited.ok && !credited.duplicate) {
         emitBillingToAccount(accountId);
+      } else if (lockCleared && credited.duplicate) {
+        persistBillingStore();
       }
+    } else if (accountId) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[stripe] ignored checkout.session.completed id=${session?.id || "?"} account=${accountId} pack=${packId} paid=${session?.payment_status} metadataCredit=${creditCents} amount=${amountTotal}`
+      );
     }
   }
 
@@ -2178,18 +2437,40 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
 
 app.use(express.json({ limit: "64kb" }));
 
-app.get("/api/auth/me", (req, res) => {
+const authReadLimiter = withHttpRateLimit("auth-read", 90, 60_000, (req) =>
+  sanitizeUserId(req.billingUserId)
+);
+const authRegisterLimiter = withHttpRateLimit("auth-register", 10, 10 * 60_000, (req) =>
+  validEmail(req.body?.email || "")
+);
+const authLoginLimiter = withHttpRateLimit("auth-login", 24, 10 * 60_000, (req) =>
+  validEmail(req.body?.email || "")
+);
+const authBindSocketLimiter = withHttpRateLimit("auth-bind-socket", 90, 60_000, (req) =>
+  `${sanitizeUserId(req.billingUserId)}:${String(req.body?.socketId || "").trim()}`
+);
+const authLogoutLimiter = withHttpRateLimit("auth-logout", 30, 60_000, (req) =>
+  sanitizeUserId(req.billingUserId)
+);
+const billingReadLimiter = withHttpRateLimit("billing-read", 90, 60_000, (req) =>
+  sanitizeUserId(req.billingUserId)
+);
+const checkoutLimiter = withHttpRateLimit("billing-checkout", 12, 60_000, (req) =>
+  `${sanitizeUserId(req.billingUserId)}:${String(req.body?.packId || "").trim()}`
+);
+
+app.get("/api/auth/me", authReadLimiter, (req, res) => {
   const accountId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(accountId, req.clientIp);
+  ensureBillingAccount(accountId, req.clientIp, req.clientFingerprint);
   res.json({
     auth: authSnapshot(accountId),
     billing: billingSnapshot(accountId)
   });
 });
 
-app.post("/api/auth/register", (req, res) => {
+app.post("/api/auth/register", authRegisterLimiter, (req, res) => {
   const guestId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(guestId, req.clientIp);
+  ensureBillingAccount(guestId, req.clientIp, req.clientFingerprint);
 
   const email = validEmail(req.body?.email || "");
   const password = String(req.body?.password || "");
@@ -2202,7 +2483,7 @@ app.post("/api/auth/register", (req, res) => {
     return;
   }
   if (billingStore.authByEmail[email]) {
-    res.status(409).json({ error: "Email is already registered." });
+    res.status(409).json({ error: "Unable to register with this email." });
     return;
   }
 
@@ -2219,6 +2500,7 @@ app.post("/api/auth/register", (req, res) => {
     freeGrantCents: 0,
     purchasedCents: 0,
     spentCents: 0,
+    checkoutLockUntil: 0,
     createdAt: Date.now(),
     lastSeenAt: Date.now()
   };
@@ -2242,9 +2524,9 @@ app.post("/api/auth/register", (req, res) => {
   });
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", authLoginLimiter, (req, res) => {
   const guestId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(guestId, req.clientIp);
+  ensureBillingAccount(guestId, req.clientIp, req.clientFingerprint);
 
   const email = validEmail(req.body?.email || "");
   const password = String(req.body?.password || "");
@@ -2279,9 +2561,9 @@ app.post("/api/auth/login", (req, res) => {
   });
 });
 
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", authLogoutLimiter, (req, res) => {
   const guestId = createAnonymousUserId();
-  ensureBillingAccount(guestId, req.clientIp);
+  ensureBillingAccount(guestId, req.clientIp, req.clientFingerprint);
   setIdentityCookie(res, guestId);
   res.json({
     auth: authSnapshot(guestId),
@@ -2289,19 +2571,36 @@ app.post("/api/auth/logout", (req, res) => {
   });
 });
 
-app.post("/api/auth/bind-socket", (req, res) => {
+app.post("/api/auth/bind-socket", authBindSocketLimiter, (req, res) => {
   const accountId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(accountId, req.clientIp);
+  ensureBillingAccount(accountId, req.clientIp, req.clientFingerprint);
 
   const socketId = String(req.body?.socketId || "").trim();
+  const bindToken = String(req.body?.bindToken || "").trim();
   if (!socketId) {
     res.status(400).json({ error: "socketId is required." });
+    return;
+  }
+  if (!bindToken) {
+    res.status(400).json({ error: "bindToken is required." });
     return;
   }
 
   const sock = io.sockets.sockets.get(socketId);
   if (!sock) {
     res.status(404).json({ error: "Socket not found." });
+    return;
+  }
+
+  const tokenCheck = verifySocketBindChallenge(socketId, bindToken);
+  if (!tokenCheck.ok) {
+    const refreshed = createSocketBindChallenge(socketId);
+    io.to(socketId).emit("bindSocketChallenge", {
+      socketId,
+      bindToken: refreshed.token,
+      expiresAt: refreshed.expiresAt
+    });
+    res.status(401).json({ error: "Socket bind challenge failed. Refresh and try again." });
     return;
   }
 
@@ -2316,20 +2615,27 @@ app.post("/api/auth/bind-socket", (req, res) => {
     }
   }
 
+  const nextChallenge = createSocketBindChallenge(socketId);
+  io.to(socketId).emit("bindSocketChallenge", {
+    socketId,
+    bindToken: nextChallenge.token,
+    expiresAt: nextChallenge.expiresAt
+  });
   io.to(socketId).emit("billingSnapshot", billingSnapshot(accountId));
   res.json({
     auth: authSnapshot(accountId),
-    billing: billingSnapshot(accountId)
+    billing: billingSnapshot(accountId),
+    bindToken: nextChallenge.token
   });
 });
 
-app.get("/api/billing/me", (req, res) => {
+app.get("/api/billing/me", billingReadLimiter, (req, res) => {
   const accountId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(accountId, req.clientIp);
+  ensureBillingAccount(accountId, req.clientIp, req.clientFingerprint);
   res.json(billingResponse(accountId));
 });
 
-app.post("/api/billing/checkout", async (req, res) => {
+app.post("/api/billing/checkout", checkoutLimiter, async (req, res) => {
   if (!stripe) {
     res.status(503).json({ error: "Stripe is not configured." });
     return;
@@ -2344,7 +2650,7 @@ app.post("/api/billing/checkout", async (req, res) => {
   }
 
   const accountId = sanitizeUserId(req.billingUserId);
-  ensureBillingAccount(accountId, req.clientIp);
+  ensureBillingAccount(accountId, req.clientIp, req.clientFingerprint);
   const account = billingStore.users[accountId];
   if (REQUIRE_LOGIN_FOR_CHECKOUT && account?.authType !== "user") {
     res.status(401).json({
@@ -2359,6 +2665,23 @@ app.post("/api/billing/checkout", async (req, res) => {
   if (!pack) {
     res.status(400).json({ error: "Invalid packId." });
     return;
+  }
+
+  const now = Date.now();
+  const checkoutLockUntil = Math.max(0, Number(account?.checkoutLockUntil) || 0);
+  if (checkoutLockUntil > now) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((checkoutLockUntil - now) / 1000));
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+    res.status(429).json({
+      error: "Checkout is already being prepared. Please wait a few seconds.",
+      retryAfterSeconds
+    });
+    return;
+  }
+
+  if (account) {
+    account.checkoutLockUntil = now + CHECKOUT_COOLDOWN_MS;
+    persistBillingStore();
   }
 
   try {
@@ -2391,6 +2714,10 @@ app.post("/api/billing/checkout", async (req, res) => {
       checkoutUrl: session.url
     });
   } catch (error) {
+    if (account) {
+      account.checkoutLockUntil = 0;
+      persistBillingStore();
+    }
     res.status(500).json({
       error: `Stripe checkout failed: ${compactError(error, 180)}`
     });
@@ -2404,24 +2731,55 @@ io.on("connection", (socket) => {
   const cookies = parseCookieHeader(socket.handshake.headers.cookie || "");
   const accountId = sanitizeUserId(cookies[BILLING_COOKIE_NAME] || "") || createAnonymousUserId();
   const ip = resolveSocketIp(socket);
-  ensureBillingAccount(accountId, ip);
+  const fingerprint = resolveSocketFingerprint(socket);
+  ensureBillingAccount(accountId, ip, fingerprint);
   socketToAccount.set(socket.id, accountId);
+  const bindChallenge = createSocketBindChallenge(socket.id);
+
+  io.to(socket.id).emit("bindSocketChallenge", {
+    socketId: socket.id,
+    bindToken: bindChallenge.token,
+    expiresAt: bindChallenge.expiresAt
+  });
 
   io.to(socket.id).emit("powerupCatalog", { powerups: Object.values(POWERUPS) });
   io.to(socket.id).emit("avatarCatalog", { avatars: AVATAR_CATALOG });
   io.to(socket.id).emit("billingSnapshot", billingSnapshot(accountId));
 
   socket.on("createRoom", (payload) => {
+    if (
+      socketRateLimited(
+        socket,
+        "create-room",
+        8,
+        30_000,
+        "Room actions are being sent too quickly."
+      )
+    ) {
+      return;
+    }
     leaveCurrentRoom(socket);
     createRoom(socket, payload?.name);
   });
 
   socket.on("joinRoom", (payload) => {
+    if (
+      socketRateLimited(
+        socket,
+        "join-room",
+        16,
+        60_000,
+        "Join attempts are being sent too quickly."
+      )
+    ) {
+      return;
+    }
     leaveCurrentRoom(socket);
     joinRoom(socket, payload?.roomId, payload?.name);
   });
 
   socket.on("chooseAvatar", (payload) => {
+    if (socketRateLimited(socket, "choose-avatar", 24, 60_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2442,6 +2800,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("setGameMode", (payload) => {
+    if (socketRateLimited(socket, "set-mode", 12, 60_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2465,6 +2824,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("startGame", async () => {
+    if (
+      socketRateLimited(socket, "start-game", 6, 30_000, "Start requests are being sent too quickly.")
+    ) {
+      return;
+    }
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2535,6 +2899,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("updatePrompt", (payload) => {
+    if (socketRateLimited(socket, "update-prompt", 220, 10_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2548,6 +2913,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("submitPrompt", async () => {
+    if (socketRateLimited(socket, "submit-prompt", 10, 20_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2571,10 +2937,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("usePowerup", (payload) => {
+    if (socketRateLimited(socket, "use-powerup", 24, 10_000)) return;
     usePowerup(socket, payload || {});
   });
 
   socket.on("castVote", (payload) => {
+    if (socketRateLimited(socket, "cast-vote", 16, 30_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2607,6 +2975,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("setReadyForNextRound", async (payload) => {
+    if (socketRateLimited(socket, "set-ready", 24, 30_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2621,6 +2990,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("backToLobby", () => {
+    if (socketRateLimited(socket, "back-to-lobby", 8, 30_000)) return;
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -2660,6 +3030,8 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     socketToAccount.delete(socket.id);
+    socketRateWarnAt.delete(socket.id);
+    socketBindChallenges.delete(socket.id);
     leaveCurrentRoom(socket);
   });
 });
@@ -2676,5 +3048,9 @@ server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(
     `Billing: imageCost=${IMAGE_COST_CENTS}c freePlay=${FREE_PLAY_CENTS}c packs=${CREDIT_PACKS.length} checkoutLogin=${REQUIRE_LOGIN_FOR_CHECKOUT ? "required" : "guest-allowed"} stripe=${stripe && STRIPE_WEBHOOK_SECRET && STRIPE_SUCCESS_URL && STRIPE_CANCEL_URL ? "ready" : "not-ready"}`
+  );
+  // eslint-disable-next-line no-console
+  console.log(
+    `Security: trustProxy=${JSON.stringify(TRUST_PROXY)} socketBindTtlMs=${SOCKET_BIND_TOKEN_TTL_MS} checkoutCooldownMs=${CHECKOUT_COOLDOWN_MS}`
   );
 });
