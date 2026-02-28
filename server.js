@@ -23,9 +23,20 @@ const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_IMAGE_MODEL = String(process.env.OPENAI_IMAGE_MODEL || "gpt-image-1-mini").trim();
 const OPENAI_IMAGE_SIZE = String(process.env.OPENAI_IMAGE_SIZE || "1024x1024").trim();
 const OPENAI_IMAGE_QUALITY = String(process.env.OPENAI_IMAGE_QUALITY || "low").trim();
+const XAI_API_KEY = String(process.env.XAI_API_KEY || "").trim();
+const XAI_IMAGE_MODEL = String(process.env.XAI_IMAGE_MODEL || "grok-imagine-image").trim();
+const XAI_IMAGE_RESOLUTION = String(process.env.XAI_IMAGE_RESOLUTION || "").trim();
+const XAI_IMAGE_ASPECT_RATIO = String(process.env.XAI_IMAGE_ASPECT_RATIO || "").trim();
+const DEFAULT_IMAGE_PROVIDER = OPENAI_API_KEY ? "openai" : XAI_API_KEY ? "xai" : "pollinations";
 const IMAGE_PROVIDER = String(
-  process.env.IMAGE_PROVIDER || (OPENAI_API_KEY ? "openai" : "pollinations")
+  process.env.IMAGE_PROVIDER || DEFAULT_IMAGE_PROVIDER
 ).trim().toLowerCase();
+const PLAYER_IMAGE_PROVIDER = String(process.env.PLAYER_IMAGE_PROVIDER || IMAGE_PROVIDER)
+  .trim()
+  .toLowerCase();
+const REFERENCE_IMAGE_PROVIDER = String(process.env.REFERENCE_IMAGE_PROVIDER || IMAGE_PROVIDER)
+  .trim()
+  .toLowerCase();
 const BLACK_CARD_PROMPT_FILE = path.join(__dirname, "data", "against-humanity-prompts.json");
 
 const GAME_MODES = {
@@ -398,18 +409,46 @@ async function fetchImageBuffer(url, retries = 3) {
   throw new Error("Image fetch exhausted retries");
 }
 
-function providerChain() {
-  if (IMAGE_PROVIDER === "openai") {
-    return ["openai", "pollinations"];
+function normalizePreferredProvider(provider) {
+  const value = String(provider || "")
+    .trim()
+    .toLowerCase();
+  if (value === "xai" || value === "grok") return "xai";
+  if (value === "openai" || value === "pollinations") return value;
+  return "auto";
+}
+
+function providerChain(kind = "player") {
+  const preferredRaw = kind === "reference" ? REFERENCE_IMAGE_PROVIDER : PLAYER_IMAGE_PROVIDER;
+  const preferred = normalizePreferredProvider(preferredRaw);
+  const order = [];
+
+  if (preferred !== "auto") {
+    order.push(preferred);
   }
-  return ["pollinations", "openai"];
+
+  if (OPENAI_API_KEY) {
+    order.push("openai");
+  }
+  if (XAI_API_KEY) {
+    order.push("xai");
+  }
+  order.push("pollinations");
+
+  return [...new Set(order)].map(normalizeProvider).filter(Boolean);
 }
 
 function normalizeProvider(provider) {
-  if (provider === "openai" && !OPENAI_API_KEY) {
-    return null;
+  if (provider === "openai") {
+    return OPENAI_API_KEY ? "openai" : null;
   }
-  return provider;
+  if (provider === "xai") {
+    return XAI_API_KEY ? "xai" : null;
+  }
+  if (provider === "pollinations") {
+    return "pollinations";
+  }
+  return null;
 }
 
 async function generateWithOpenAI(prompt) {
@@ -450,8 +489,55 @@ async function generateWithOpenAI(prompt) {
   throw new Error("OpenAI image response missing image data");
 }
 
-async function generateGameImage(prompt, seed) {
-  const chain = providerChain().map(normalizeProvider).filter(Boolean);
+async function generateWithXAI(prompt) {
+  if (!XAI_API_KEY) {
+    throw new Error("XAI_API_KEY missing");
+  }
+
+  const payload = {
+    model: XAI_IMAGE_MODEL,
+    prompt
+  };
+
+  if (XAI_IMAGE_RESOLUTION) {
+    payload.resolution = XAI_IMAGE_RESOLUTION;
+  }
+  if (XAI_IMAGE_ASPECT_RATIO) {
+    payload.aspect_ratio = XAI_IMAGE_ASPECT_RATIO;
+  }
+
+  const response = await fetch("https://api.x.ai/v1/images/generations", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${XAI_API_KEY}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`xAI image error ${response.status}: ${body.slice(0, 200)}`);
+  }
+
+  const json = await response.json();
+  const data = json?.data?.[0];
+  const b64 = data?.b64_json;
+  const url = data?.url;
+
+  if (b64) {
+    return `data:image/png;base64,${b64}`;
+  }
+  if (url) {
+    return url;
+  }
+
+  throw new Error("xAI image response missing image data");
+}
+
+async function generateGameImage(prompt, seed, options = {}) {
+  const kind = options.kind === "reference" ? "reference" : "player";
+  const chain = providerChain(kind);
   const errors = [];
 
   for (const provider of chain) {
@@ -464,6 +550,12 @@ async function generateGameImage(prompt, seed) {
 
       if (provider === "openai") {
         const url = await generateWithOpenAI(prompt);
+        await fetchImageBuffer(url, 1);
+        return { url, provider };
+      }
+
+      if (provider === "xai") {
+        const url = await generateWithXAI(prompt);
         await fetchImageBuffer(url, 1);
         return { url, provider };
       }
@@ -513,7 +605,7 @@ function resetRoomForImageFailure(room, context, error) {
 
   io.to(room.id).emit("errorMessage", {
     message:
-      "Image generation is unavailable right now. Set OPENAI_API_KEY for reliable prompt-to-image output."
+      "Image generation is unavailable right now. Set OPENAI_API_KEY or XAI_API_KEY for reliable prompt-to-image output."
   });
   io.to(room.id).emit("systemMessage", {
     message: `Round aborted during ${context}: ${compactError(error)}`
@@ -877,7 +969,7 @@ async function startRound(room) {
     const seed = Math.floor(Math.random() * 1_000_000_000);
     let ref;
     try {
-      ref = await generateGameImage(refPrompt, seed);
+      ref = await generateGameImage(refPrompt, seed, { kind: "reference" });
     } catch (error) {
       resetRoomForImageFailure(room, "reference generation", error);
       return;
@@ -950,7 +1042,7 @@ async function lockRound(roomId, reason) {
     let generated;
     let generationError = "";
     try {
-      generated = await generateGameImage(player.finalPrompt, seed);
+      generated = await generateGameImage(player.finalPrompt, seed, { kind: "player" });
     } catch (error) {
       generationError = compactError(error, 100);
       generated = {
@@ -1772,7 +1864,7 @@ server.listen(PORT, () => {
   console.log(`Prompt Sabotage Arena listening on http://localhost:${PORT}`);
   // eslint-disable-next-line no-console
   console.log(
-    `Image provider mode=${IMAGE_PROVIDER}, OPENAI_API_KEY=${OPENAI_API_KEY ? "set" : "missing"}`
+    `Image providers: base=${IMAGE_PROVIDER} player=${PLAYER_IMAGE_PROVIDER} reference=${REFERENCE_IMAGE_PROVIDER} | OPENAI_API_KEY=${OPENAI_API_KEY ? "set" : "missing"} XAI_API_KEY=${XAI_API_KEY ? "set" : "missing"}`
   );
   // eslint-disable-next-line no-console
   console.log(`Black-card prompt catalog loaded: ${BLACK_CARD_PROMPT_CATALOG.length}`);
