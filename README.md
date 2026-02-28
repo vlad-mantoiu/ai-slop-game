@@ -23,8 +23,37 @@ Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
 
 ### Against Humanity Prompt Pool
 
-- 500 stored black-card prompts in [`data/against-humanity-prompts.json`](data/against-humanity-prompts.json).
+- Stored black-card prompts in [`data/against-humanity-prompts.json`](data/against-humanity-prompts.json).
 - Prompt order is shuffled per session to reduce repeats.
+
+## Credits & Billing
+
+- Host wallet is charged server-side before each round starts.
+- Default cost: `2` cents per generated image (`IMAGE_COST_CENTS=2`).
+- Default free trial: `100` cents once per user/IP (`FREE_PLAY_CENTS=100`).
+- Round cost formula:
+  - `Classic`: `(players + 1) * IMAGE_COST_CENTS` (reference + all player images)
+  - `Against Humanity`: `players * IMAGE_COST_CENTS`
+- If host balance is insufficient, next round is blocked and host gets a pay prompt.
+- Billing data is persisted in `data/billing-store.json` (single-instance MVP).
+
+### Stripe Top-Ups (Optional)
+
+Set these to enable real card checkout:
+
+```bash
+export STRIPE_SECRET_KEY=sk_live_or_test_xxx
+export STRIPE_WEBHOOK_SECRET=whsec_xxx
+export APP_BASE_URL=https://your-app-url
+export STRIPE_SUCCESS_URL=https://your-app-url/?checkout=success
+export STRIPE_CANCEL_URL=https://your-app-url/?checkout=cancel
+```
+
+Optional packs (JSON):
+
+```bash
+export CREDIT_PACKS_JSON='[{"id":"pack_500","label":"$5.00 credits","priceCents":500,"creditCents":500}]'
+```
 
 ## Powerups
 

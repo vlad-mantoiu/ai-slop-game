@@ -501,6 +501,34 @@ textarea {
   align-content: start;
 }
 
+.billing-panel {
+  border: 1px solid rgba(39, 199, 194, 0.38);
+  border-radius: 12px;
+  padding: 10px;
+  background:
+    radial-gradient(circle at 8% 10%, rgba(39, 199, 194, 0.14), transparent 45%),
+    rgba(17, 38, 52, 0.72);
+  display: grid;
+  gap: 8px;
+}
+
+.credit-balance {
+  font-size: 1.4rem;
+  color: #e4fffd;
+  font-weight: 800;
+}
+
+.credit-packs {
+  display: grid;
+  gap: 8px;
+}
+
+.credit-packs .btn {
+  text-align: left;
+  font-size: 0.82rem;
+  padding: 8px 10px;
+}
+
 .meta-list {
   display: grid;
   gap: 8px;

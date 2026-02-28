@@ -2,8 +2,10 @@ const express = require("express");
 const http = require("http");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const sharp = require("sharp");
+const Stripe = require("stripe");
 require("dotenv").config({ quiet: true });
 
 const app = express();
@@ -38,6 +40,27 @@ const REFERENCE_IMAGE_PROVIDER = String(process.env.REFERENCE_IMAGE_PROVIDER || 
   .trim()
   .toLowerCase();
 const BLACK_CARD_PROMPT_FILE = path.join(__dirname, "data", "against-humanity-prompts.json");
+const BILLING_STORE_FILE = path.join(__dirname, "data", "billing-store.json");
+const BILLING_COOKIE_NAME = "slop_uid";
+const IMAGE_COST_CENTS = Math.max(1, Number(process.env.IMAGE_COST_CENTS || 2));
+const FREE_PLAY_CENTS = Math.max(0, Number(process.env.FREE_PLAY_CENTS || 100));
+const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || "").trim();
+const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+const APP_BASE_URL = String(process.env.APP_BASE_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
+const STRIPE_SUCCESS_URL = String(
+  process.env.STRIPE_SUCCESS_URL || (APP_BASE_URL ? `${APP_BASE_URL}/?checkout=success` : "")
+).trim();
+const STRIPE_CANCEL_URL = String(
+  process.env.STRIPE_CANCEL_URL || (APP_BASE_URL ? `${APP_BASE_URL}/?checkout=cancel` : "")
+).trim();
+
+const DEFAULT_CREDIT_PACKS = [
+  { id: "pack_500", label: "$5.00 credits", priceCents: 500, creditCents: 500 },
+  { id: "pack_1000", label: "$10.00 credits", priceCents: 1000, creditCents: 1100 },
+  { id: "pack_2000", label: "$20.00 credits", priceCents: 2000, creditCents: 2400 }
+];
 
 const GAME_MODES = {
   classic: {
@@ -53,11 +76,354 @@ const GAME_MODES = {
 };
 
 const GAME_MODE_IDS = Object.keys(GAME_MODES);
+const STRIPE_CURRENCY = "usd";
+const USER_ID_PATTERN = /^[a-f0-9-]{16,64}$/i;
 
 const rooms = new Map();
 const socketToRoom = new Map();
+const socketToAccount = new Map();
 const AVATAR_DIR = path.join(__dirname, "avatars");
 const AVATAR_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"]);
+
+function parseCreditPacks() {
+  const raw = String(process.env.CREDIT_PACKS_JSON || "").trim();
+  if (!raw) return DEFAULT_CREDIT_PACKS;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return DEFAULT_CREDIT_PACKS;
+    }
+    const cleaned = parsed
+      .map((pack) => ({
+        id: String(pack?.id || "").trim(),
+        label: String(pack?.label || "").trim(),
+        priceCents: Math.max(100, Number(pack?.priceCents) || 0),
+        creditCents: Math.max(100, Number(pack?.creditCents) || 0)
+      }))
+      .filter((pack) => pack.id && pack.label);
+    return cleaned.length ? cleaned : DEFAULT_CREDIT_PACKS;
+  } catch {
+    return DEFAULT_CREDIT_PACKS;
+  }
+}
+
+const CREDIT_PACKS = parseCreditPacks();
+const CREDIT_PACK_BY_ID = new Map(CREDIT_PACKS.map((pack) => [pack.id, pack]));
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+function parseCookieHeader(header) {
+  const out = {};
+  const raw = String(header || "").trim();
+  if (!raw) return out;
+  raw.split(";").forEach((part) => {
+    const [k, ...rest] = part.split("=");
+    const key = String(k || "").trim();
+    if (!key) return;
+    const value = rest.join("=").trim() || "";
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
+  });
+  return out;
+}
+
+function sanitizeUserId(value) {
+  const v = String(value || "").trim();
+  if (!USER_ID_PATTERN.test(v)) return "";
+  return v;
+}
+
+function createAnonymousUserId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function normalizeIp(value) {
+  let ip = String(value || "").trim().toLowerCase();
+  if (!ip) return "";
+  if (ip.includes(",")) {
+    ip = ip.split(",")[0].trim();
+  }
+  if (ip.startsWith("::ffff:")) {
+    ip = ip.slice(7);
+  }
+  return ip;
+}
+
+function resolveRequestIp(req) {
+  return normalizeIp(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "");
+}
+
+function resolveSocketIp(socket) {
+  return normalizeIp(
+    socket?.handshake?.headers?.["x-forwarded-for"] || socket?.handshake?.address || ""
+  );
+}
+
+function loadBillingStore() {
+  try {
+    const raw = fs.readFileSync(BILLING_STORE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      users: parsed?.users && typeof parsed.users === "object" ? parsed.users : {},
+      freeGrantIps:
+        parsed?.freeGrantIps && typeof parsed.freeGrantIps === "object" ? parsed.freeGrantIps : {},
+      processedPayments:
+        parsed?.processedPayments && typeof parsed.processedPayments === "object"
+          ? parsed.processedPayments
+          : {},
+      ledger: Array.isArray(parsed?.ledger) ? parsed.ledger : []
+    };
+  } catch {
+    return {
+      users: {},
+      freeGrantIps: {},
+      processedPayments: {},
+      ledger: []
+    };
+  }
+}
+
+let billingStore = loadBillingStore();
+
+function persistBillingStore() {
+  const dir = path.dirname(BILLING_STORE_FILE);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${BILLING_STORE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(billingStore, null, 2));
+  fs.renameSync(tmp, BILLING_STORE_FILE);
+}
+
+function appendLedger(entry) {
+  billingStore.ledger.push({
+    at: Date.now(),
+    ...entry
+  });
+  if (billingStore.ledger.length > 6000) {
+    billingStore.ledger = billingStore.ledger.slice(-6000);
+  }
+}
+
+function ensureBillingAccount(userId, ipRaw) {
+  const accountId = sanitizeUserId(userId);
+  if (!accountId) return null;
+
+  const ip = normalizeIp(ipRaw);
+  let changed = false;
+  let account = billingStore.users[accountId];
+  if (!account) {
+    const grantAllowed = ip && !billingStore.freeGrantIps[ip];
+    const freeGrantCents = grantAllowed ? FREE_PLAY_CENTS : 0;
+    if (grantAllowed) {
+      billingStore.freeGrantIps[ip] = Date.now();
+    }
+
+    account = {
+      id: accountId,
+      balanceCents: freeGrantCents,
+      freeGrantCents,
+      purchasedCents: 0,
+      spentCents: 0,
+      createdAt: Date.now(),
+      lastSeenAt: Date.now()
+    };
+    billingStore.users[accountId] = account;
+    appendLedger({
+      type: "account-create",
+      userId: accountId,
+      freeGrantCents
+    });
+    changed = true;
+  } else {
+    account.lastSeenAt = Date.now();
+    changed = true;
+  }
+
+  if (changed) {
+    persistBillingStore();
+  }
+  return account;
+}
+
+function billingSnapshot(accountId) {
+  const account = billingStore.users[accountId];
+  return {
+    accountId,
+    balanceCents: Math.max(0, Number(account?.balanceCents) || 0),
+    freeGrantCents: Math.max(0, Number(account?.freeGrantCents) || 0),
+    purchasedCents: Math.max(0, Number(account?.purchasedCents) || 0),
+    spentCents: Math.max(0, Number(account?.spentCents) || 0),
+    imageCostCents: IMAGE_COST_CENTS,
+    freePlayCents: FREE_PLAY_CENTS,
+    packs: CREDIT_PACKS,
+    stripeEnabled: Boolean(
+      stripe &&
+        STRIPE_WEBHOOK_SECRET &&
+        STRIPE_SUCCESS_URL &&
+        STRIPE_CANCEL_URL &&
+        CREDIT_PACKS.length > 0
+    )
+  };
+}
+
+function debitCredits(accountId, cents, reason, meta = {}) {
+  const account = billingStore.users[accountId];
+  const amount = Math.max(0, Math.floor(Number(cents) || 0));
+  if (!account || amount <= 0) {
+    return { ok: false, balanceCents: Number(account?.balanceCents) || 0 };
+  }
+
+  const current = Math.max(0, Number(account.balanceCents) || 0);
+  if (current < amount) {
+    return { ok: false, balanceCents: current };
+  }
+
+  account.balanceCents = current - amount;
+  account.spentCents = Math.max(0, Number(account.spentCents) || 0) + amount;
+  account.lastSeenAt = Date.now();
+  appendLedger({
+    type: "debit",
+    userId: accountId,
+    cents: amount,
+    reason,
+    meta
+  });
+  persistBillingStore();
+  return { ok: true, balanceCents: account.balanceCents };
+}
+
+function creditCredits(accountId, cents, reason, externalId = "", meta = {}) {
+  const account = billingStore.users[accountId];
+  const amount = Math.max(0, Math.floor(Number(cents) || 0));
+  if (!account || amount <= 0) {
+    return { ok: false, duplicate: false, balanceCents: Number(account?.balanceCents) || 0 };
+  }
+
+  if (externalId && billingStore.processedPayments[externalId]) {
+    return {
+      ok: true,
+      duplicate: true,
+      balanceCents: Math.max(0, Number(account.balanceCents) || 0)
+    };
+  }
+
+  account.balanceCents = Math.max(0, Number(account.balanceCents) || 0) + amount;
+  if (reason === "stripe-topup") {
+    account.purchasedCents = Math.max(0, Number(account.purchasedCents) || 0) + amount;
+  }
+  account.lastSeenAt = Date.now();
+
+  if (externalId) {
+    billingStore.processedPayments[externalId] = {
+      userId: accountId,
+      cents: amount,
+      at: Date.now(),
+      reason
+    };
+  }
+
+  appendLedger({
+    type: "credit",
+    userId: accountId,
+    cents: amount,
+    reason,
+    externalId,
+    meta
+  });
+  persistBillingStore();
+  return { ok: true, duplicate: false, balanceCents: account.balanceCents };
+}
+
+function roundImageCount(room) {
+  if (!room) return 0;
+  if (room.modeId === "humanity") {
+    return room.players.size;
+  }
+  return room.players.size + 1;
+}
+
+function roundCostCents(room) {
+  return roundImageCount(room) * IMAGE_COST_CENTS;
+}
+
+function formatUsd(cents) {
+  return `$${(Math.max(0, Number(cents) || 0) / 100).toFixed(2)}`;
+}
+
+function billingOwnerPlayer(room) {
+  if (!room || room.players.size === 0) return null;
+  return room.players.get(room.hostId) || [...room.players.values()][0] || null;
+}
+
+function emitBillingToAccount(accountId) {
+  if (!accountId) return;
+  const payload = billingSnapshot(accountId);
+  for (const [socketId, mappedAccountId] of socketToAccount.entries()) {
+    if (mappedAccountId === accountId) {
+      io.to(socketId).emit("billingSnapshot", payload);
+    }
+  }
+}
+
+function ensureRoundFunding(room, nextRoundNumber) {
+  const payer = billingOwnerPlayer(room);
+  const accountId = payer?.accountId || "";
+  const costCents = roundCostCents(room);
+  if (!accountId) {
+    return {
+      ok: false,
+      reason: "missing-account",
+      payerSocketId: payer?.id || "",
+      costCents,
+      balanceCents: 0
+    };
+  }
+
+  const debited = debitCredits(accountId, costCents, "round-start", {
+    roomId: room.id,
+    roundNumber: nextRoundNumber,
+    modeId: room.modeId,
+    images: roundImageCount(room)
+  });
+
+  emitBillingToAccount(accountId);
+  if (!debited.ok) {
+    return {
+      ok: false,
+      reason: "insufficient-funds",
+      payerSocketId: payer.id,
+      costCents,
+      balanceCents: debited.balanceCents
+    };
+  }
+
+  room.pendingRoundCharge = {
+    accountId,
+    roomId: room.id,
+    roundNumber: nextRoundNumber,
+    costCents
+  };
+
+  return {
+    ok: true,
+    payerSocketId: payer.id,
+    costCents,
+    balanceCents: debited.balanceCents
+  };
+}
+
+function refundPendingRoundCharge(room, reason = "round-refund", meta = {}) {
+  if (!room?.pendingRoundCharge) return;
+  const pending = room.pendingRoundCharge;
+  room.pendingRoundCharge = null;
+  const externalId = `refund:${pending.roomId}:${pending.roundNumber}:${reason}`;
+  creditCredits(pending.accountId, pending.costCents, reason, externalId, meta);
+  emitBillingToAccount(pending.accountId);
+}
 
 const POWERUPS = {
   blackout: {
@@ -576,6 +942,10 @@ function compactError(error, max = 220) {
 
 function resetRoomForImageFailure(room, context, error) {
   clearRoomTimers(room);
+  refundPendingRoundCharge(room, "round-aborted", {
+    context,
+    error: compactError(error, 140)
+  });
 
   room.phase = "lobby";
   room.roundNumber = 0;
@@ -648,10 +1018,11 @@ async function similarityScore(referenceUrl, candidateUrl) {
   }
 }
 
-function createPlayer(socket, name) {
+function createPlayer(socket, name, accountId = "") {
   return {
     id: socket.id,
     name: sanitizeName(name),
+    accountId: sanitizeUserId(accountId),
     avatarId: "",
     score: 0,
     readyForNextRound: false,
@@ -686,6 +1057,7 @@ function clearRoomTimers(room) {
 function destroyRoomIfEmpty(room) {
   if (room.players.size > 0) return;
   clearRoomTimers(room);
+  refundPendingRoundCharge(room, "room-closed", { reason: "empty-room" });
   rooms.delete(room.id);
 }
 
@@ -715,6 +1087,9 @@ function emitRoomSnapshot(room) {
       toWin: TO_WIN,
       modeId: room.modeId || "classic",
       gameModes: GAME_MODE_IDS.map((id) => GAME_MODES[id]),
+      roundCostCents: roundCostCents(room),
+      roundImageCount: roundImageCount(room),
+      imageCostCents: IMAGE_COST_CENTS,
       tiebreakerNextRound: room.tiebreakerNextRound,
       players: allPlayers.map((p) => playerPublic(p, viewer.id)),
       self: {
@@ -727,7 +1102,8 @@ function emitRoomSnapshot(room) {
         powerups: viewer.powerups.map((id) => POWERUPS[id]),
         prompt: viewer.draftPrompt,
         submitted: viewer.submitted,
-        effects: viewer.effects
+        effects: viewer.effects,
+        billing: billingSnapshot(viewer.accountId)
       }
     });
   }
@@ -917,9 +1293,44 @@ async function startRound(room) {
   const modeId = validModeId(room.modeId);
   room.modeId = modeId;
   const powerupsEnabled = modeSupportsPowerups(room);
+  const nextRoundNumber = room.roundNumber + 1;
 
   clearRoomTimers(room);
-  room.roundNumber += 1;
+
+  const funding = ensureRoundFunding(room, nextRoundNumber);
+  if (!funding.ok) {
+    const balanceText = formatUsd(funding.balanceCents);
+    const costText = formatUsd(funding.costCents);
+    for (const player of room.players.values()) {
+      player.readyForNextRound = false;
+    }
+    room.phase = room.roundNumber > 0 ? "intermission" : "lobby";
+    io.to(room.id).emit("systemMessage", {
+      message: `Not enough credits for next round. Need ${costText}, current balance ${balanceText}.`
+    });
+    if (room.phase === "intermission") {
+      io.to(room.id).emit("readyUpStarted", {
+        modeId: room.modeId,
+        chaosRound: modeSupportsPowerups(room) && room.tiebreakerNextRound,
+        tiebreakerRound: room.tiebreakerNextRound,
+        totalPlayers: room.players.size
+      });
+    }
+    const targetSocket = funding.payerSocketId || room.hostId;
+    if (targetSocket) {
+      io.to(targetSocket).emit("billingRequired", {
+        reason: funding.reason,
+        neededCents: Math.max(0, funding.costCents - funding.balanceCents),
+        costCents: funding.costCents,
+        balanceCents: funding.balanceCents,
+        nextRoundNumber
+      });
+    }
+    emitRoomSnapshot(room);
+    return;
+  }
+
+  room.roundNumber = nextRoundNumber;
   room.phase = "round";
   room.submissions = new Map();
   room.revealOrder = [];
@@ -1018,6 +1429,7 @@ async function lockRound(roomId, reason) {
   if (!room || room.phase !== "round") return;
 
   room.phase = "generating";
+  room.pendingRoundCharge = null;
   if (room.roundTickTimer) {
     clearInterval(room.roundTickTimer);
     room.roundTickTimer = null;
@@ -1359,11 +1771,13 @@ function createRoom(socket, name) {
     voteTickTimer: null,
     showcaseTimer: null,
     startingNextRound: false,
+    pendingRoundCharge: null,
     roundEndsAt: 0,
     voteEndsAt: 0
   };
 
-  const player = createPlayer(socket, name);
+  const accountId = socketToAccount.get(socket.id) || "";
+  const player = createPlayer(socket, name, accountId);
   room.players.set(socket.id, player);
 
   rooms.set(id, room);
@@ -1392,7 +1806,8 @@ function joinRoom(socket, roomId, name) {
     return;
   }
 
-  const player = createPlayer(socket, name);
+  const accountId = socketToAccount.get(socket.id) || "";
+  const player = createPlayer(socket, name, accountId);
   room.players.set(socket.id, player);
 
   socketToRoom.set(socket.id, id);
@@ -1425,6 +1840,7 @@ function leaveCurrentRoom(socket) {
 
   if (room.players.size < 2 && room.phase !== "lobby" && room.phase !== "ended") {
     clearRoomTimers(room);
+    refundPendingRoundCharge(room, "round-cancelled", { reason: "player-left" });
     room.phase = "lobby";
     room.roundNumber = 0;
     room.tiebreakerNextRound = false;
@@ -1437,6 +1853,8 @@ function leaveCurrentRoom(socket) {
     room.revealOrder = [];
     room.votes = new Map();
     room.reference = null;
+    room.pendingRoundCharge = null;
+    room.pendingRoundCharge = null;
     io.to(room.id).emit("systemMessage", {
       message: "Not enough players to continue. Match reset to lobby."
     });
@@ -1602,12 +2020,157 @@ function usePowerup(socket, payload) {
   emitRoomSnapshot(room);
 }
 
+function ensureRequestIdentity(req, res, next) {
+  if (req.path === "/api/stripe/webhook") {
+    next();
+    return;
+  }
+
+  const cookies = parseCookieHeader(req.headers.cookie || "");
+  let userId = sanitizeUserId(cookies[BILLING_COOKIE_NAME] || "");
+  if (!userId) {
+    userId = createAnonymousUserId();
+  }
+
+  const secure = process.env.NODE_ENV === "production";
+  const cookieValue = `${BILLING_COOKIE_NAME}=${encodeURIComponent(userId)}; Path=/; Max-Age=${60 * 60 * 24 * 365}; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`;
+  res.setHeader("Set-Cookie", cookieValue);
+
+  req.billingUserId = userId;
+  req.clientIp = resolveRequestIp(req);
+  ensureBillingAccount(userId, req.clientIp);
+  next();
+}
+
+function billingResponse(userId) {
+  return {
+    billing: billingSnapshot(userId)
+  };
+}
+
+app.use(ensureRequestIdentity);
+
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    res.status(503).send("Stripe webhook not configured");
+    return;
+  }
+
+  const signature = req.headers["stripe-signature"];
+  if (!signature) {
+    res.status(400).send("Missing stripe signature");
+    return;
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    res.status(400).send(`Webhook Error: ${error.message}`);
+    return;
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const accountId = sanitizeUserId(session?.metadata?.slop_user_id || "");
+    const creditCents = Math.max(0, Number(session?.metadata?.credit_cents || 0));
+    const packId = String(session?.metadata?.pack_id || "");
+    if (accountId && creditCents > 0 && session?.payment_status === "paid") {
+      ensureBillingAccount(accountId, "");
+      const externalId = `stripe:checkout:${session.id}`;
+      const credited = creditCredits(accountId, creditCents, "stripe-topup", externalId, {
+        packId
+      });
+      if (credited.ok && !credited.duplicate) {
+        emitBillingToAccount(accountId);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
+app.use(express.json({ limit: "64kb" }));
+
+app.get("/api/billing/me", (req, res) => {
+  const accountId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(accountId, req.clientIp);
+  res.json(billingResponse(accountId));
+});
+
+app.post("/api/billing/checkout", async (req, res) => {
+  if (!stripe) {
+    res.status(503).json({ error: "Stripe is not configured." });
+    return;
+  }
+  if (!STRIPE_WEBHOOK_SECRET) {
+    res.status(503).json({ error: "Stripe webhook secret is missing." });
+    return;
+  }
+  if (!STRIPE_SUCCESS_URL || !STRIPE_CANCEL_URL) {
+    res.status(503).json({ error: "Stripe success/cancel URLs are not configured." });
+    return;
+  }
+
+  const accountId = sanitizeUserId(req.billingUserId);
+  ensureBillingAccount(accountId, req.clientIp);
+
+  const packId = String(req.body?.packId || "").trim();
+  const pack = CREDIT_PACK_BY_ID.get(packId);
+  if (!pack) {
+    res.status(400).json({ error: "Invalid packId." });
+    return;
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: STRIPE_CURRENCY,
+            unit_amount: pack.priceCents,
+            product_data: {
+              name: pack.label,
+              description: `${formatUsd(pack.creditCents)} in game credits`
+            }
+          }
+        }
+      ],
+      success_url: STRIPE_SUCCESS_URL,
+      cancel_url: STRIPE_CANCEL_URL,
+      metadata: {
+        slop_user_id: accountId,
+        pack_id: pack.id,
+        credit_cents: String(pack.creditCents)
+      }
+    });
+
+    res.json({
+      checkoutUrl: session.url
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: `Stripe checkout failed: ${compactError(error, 180)}`
+    });
+  }
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/avatars", express.static(AVATAR_DIR));
 
 io.on("connection", (socket) => {
+  const cookies = parseCookieHeader(socket.handshake.headers.cookie || "");
+  const accountId = sanitizeUserId(cookies[BILLING_COOKIE_NAME] || "") || createAnonymousUserId();
+  const ip = resolveSocketIp(socket);
+  ensureBillingAccount(accountId, ip);
+  socketToAccount.set(socket.id, accountId);
+
   io.to(socket.id).emit("powerupCatalog", { powerups: Object.values(POWERUPS) });
   io.to(socket.id).emit("avatarCatalog", { avatars: AVATAR_CATALOG });
+  io.to(socket.id).emit("billingSnapshot", billingSnapshot(accountId));
 
   socket.on("createRoom", (payload) => {
     leaveCurrentRoom(socket);
@@ -1826,6 +2389,7 @@ io.on("connection", (socket) => {
     if (room.hostId !== socket.id) return;
 
     clearRoomTimers(room);
+    refundPendingRoundCharge(room, "back-to-lobby", { roomId: room.id });
     room.phase = "lobby";
     room.roundNumber = 0;
     room.tiebreakerNextRound = false;
@@ -1838,6 +2402,7 @@ io.on("connection", (socket) => {
     room.revealOrder = [];
     room.votes = new Map();
     room.reference = null;
+    room.pendingRoundCharge = null;
     for (const p of room.players.values()) {
       p.score = 0;
       p.readyForNextRound = false;
@@ -1855,6 +2420,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
+    socketToAccount.delete(socket.id);
     leaveCurrentRoom(socket);
   });
 });
@@ -1868,4 +2434,8 @@ server.listen(PORT, () => {
   );
   // eslint-disable-next-line no-console
   console.log(`Black-card prompt catalog loaded: ${BLACK_CARD_PROMPT_CATALOG.length}`);
+  // eslint-disable-next-line no-console
+  console.log(
+    `Billing: imageCost=${IMAGE_COST_CENTS}c freePlay=${FREE_PLAY_CENTS}c packs=${CREDIT_PACKS.length} stripe=${stripe && STRIPE_WEBHOOK_SECRET && STRIPE_SUCCESS_URL && STRIPE_CANCEL_URL ? "ready" : "not-ready"}`
+  );
 });

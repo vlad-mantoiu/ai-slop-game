@@ -28,6 +28,16 @@ const state = {
     totalVotes: 0,
     requiredVotes: 0
   },
+  billing: {
+    balanceCents: 0,
+    freeGrantCents: 0,
+    purchasedCents: 0,
+    spentCents: 0,
+    imageCostCents: 2,
+    freePlayCents: 100,
+    packs: [],
+    stripeEnabled: false
+  },
   feed: [],
   inputDebounce: null
 };
@@ -64,6 +74,9 @@ const dom = {
   modeHint: document.getElementById("modeHint"),
   lobbyPlayersGrid: document.getElementById("lobbyPlayersGrid"),
   lobbyScoreboard: document.getElementById("lobbyScoreboard"),
+  creditBalance: document.getElementById("creditBalance"),
+  creditMeta: document.getElementById("creditMeta"),
+  creditPacks: document.getElementById("creditPacks"),
 
   roundLabel: document.getElementById("roundLabel"),
   timerLabel: document.getElementById("timerLabel"),
@@ -139,6 +152,25 @@ const FALLBACK_IMAGE = "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://ww
 
 function currentSelf() {
   return state.room?.self || null;
+}
+
+function selfBilling() {
+  return state.room?.self?.billing || state.billing;
+}
+
+function syncBilling(payload) {
+  const direct = payload && typeof payload === "object" ? payload : null;
+  const incoming =
+    direct && typeof direct.billing === "object"
+      ? direct.billing
+      : direct && Object.prototype.hasOwnProperty.call(direct, "balanceCents")
+      ? direct
+      : null;
+  if (!incoming || typeof incoming !== "object") return;
+  state.billing = {
+    ...state.billing,
+    ...incoming
+  };
 }
 
 function isHost() {
@@ -246,6 +278,11 @@ function formatTimer(seconds) {
   return `${mm}:${ss}`;
 }
 
+function formatMoney(cents) {
+  const value = Math.max(0, Number(cents) || 0);
+  return `$${(value / 100).toFixed(2)}`;
+}
+
 function setImageSource(img, url, alt) {
   if (!img) return;
   img.alt = alt;
@@ -330,6 +367,18 @@ function renderLoading() {
   dom.loadingOverlay.classList.toggle("hidden", !active);
   if (active) {
     dom.loadingText.textContent = message;
+  }
+}
+
+async function refreshBillingFromApi() {
+  try {
+    const response = await fetch("/api/billing/me");
+    if (!response.ok) return;
+    const json = await response.json();
+    syncBilling(json);
+    renderAll();
+  } catch {
+    // ignore transient billing refresh errors
   }
 }
 
@@ -458,6 +507,65 @@ function renderModeOptions() {
   }
 }
 
+async function startCheckout(packId) {
+  try {
+    const response = await fetch("/api/billing/checkout", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ packId })
+    });
+    const json = await response.json();
+    if (!response.ok) {
+      throw new Error(json?.error || "Unable to create checkout session.");
+    }
+    if (!json?.checkoutUrl) {
+      throw new Error("Checkout URL missing.");
+    }
+    window.location.href = json.checkoutUrl;
+  } catch (error) {
+    pushFeed(String(error?.message || error || "Checkout failed."), true);
+  }
+}
+
+function renderBillingPanel() {
+  const billing = selfBilling();
+  const balanceCents = Number(billing?.balanceCents) || 0;
+  const roundCost = Number(state.room?.roundCostCents) || 0;
+  const imageCost = Number(billing?.imageCostCents) || 0;
+  const imagesPerRound = Number(state.room?.roundImageCount) || 0;
+
+  dom.creditBalance.textContent = formatMoney(balanceCents);
+  let note = `Next round cost ${formatMoney(roundCost)} (${imagesPerRound} images @ ${formatMoney(imageCost)} each).`;
+  if (!billing.stripeEnabled) {
+    note += " Top-ups are not configured yet.";
+  }
+  dom.creditMeta.textContent = note;
+
+  dom.creditPacks.innerHTML = "";
+  const packs = Array.isArray(billing?.packs) ? billing.packs : [];
+  if (!packs.length) {
+    const msg = document.createElement("p");
+    msg.className = "muted small";
+    msg.textContent = "No credit packs configured.";
+    dom.creditPacks.appendChild(msg);
+    return;
+  }
+
+  packs.forEach((pack) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn";
+    btn.disabled = !billing.stripeEnabled;
+    btn.textContent = `${pack.label} (+${formatMoney(pack.creditCents)})`;
+    btn.addEventListener("click", () => {
+      startCheckout(pack.id);
+    });
+    dom.creditPacks.appendChild(btn);
+  });
+}
+
 function renderLobby() {
   if (!state.room) return;
 
@@ -520,18 +628,24 @@ function renderLobby() {
     dom.lobbyScoreboard.appendChild(li);
   });
 
-  const canStart = isHost() && playerCount >= 2 && state.room.phase !== "starting";
+  const hostBalance = Number(selfBilling()?.balanceCents) || 0;
+  const nextRoundCost = Number(state.room.roundCostCents) || 0;
+  const hasFunds = hostBalance >= nextRoundCost;
+  const canStart = isHost() && playerCount >= 2 && state.room.phase !== "starting" && hasFunds;
   dom.startBtn.disabled = !canStart;
 
   if (!isHost()) {
     dom.lobbyHint.textContent = "Only the host can start the match.";
   } else if (playerCount < 2) {
     dom.lobbyHint.textContent = "Need at least 2 players to begin.";
+  } else if (!hasFunds) {
+    dom.lobbyHint.textContent = `Insufficient credits. Need ${formatMoney(nextRoundCost)} to start next round.`;
   } else {
     dom.lobbyHint.textContent = "Start when everyone is ready.";
   }
 
   renderModeOptions();
+  renderBillingPanel();
 }
 
 function renderPromptScoreboard() {
@@ -1353,10 +1467,16 @@ socket.on("avatarCatalog", (payload) => {
   renderAll();
 });
 
+socket.on("billingSnapshot", (payload) => {
+  syncBilling(payload);
+  renderAll();
+});
+
 socket.on("roomSnapshot", (payload) => {
   const prevPhase = state.room?.phase;
   state.room = payload;
   state.gameModes = Array.isArray(payload?.gameModes) ? payload.gameModes : state.gameModes;
+  syncBilling(payload?.self);
 
   if (payload?.self?.avatarId) {
     state.pendingAvatarId = "";
@@ -1560,6 +1680,12 @@ socket.on("errorMessage", (payload) => {
   pushFeed(payload.message, true);
 });
 
+socket.on("billingRequired", (payload) => {
+  const needed = Number(payload?.neededCents) || 0;
+  const msg = `Credits required before round start. Add at least ${formatMoney(needed)}.`;
+  pushFeed(msg, true);
+});
+
 socket.on("disconnect", () => {
   pushFeed("Disconnected from server.", true);
 });
@@ -1585,3 +1711,17 @@ setInterval(() => {
 
 renderFeed();
 renderAll();
+refreshBillingFromApi();
+
+const checkoutState = new URLSearchParams(window.location.search).get("checkout");
+if (checkoutState === "success") {
+  pushFeed("Payment completed. Credits will appear in a few seconds.");
+  refreshBillingFromApi();
+} else if (checkoutState === "cancel") {
+  pushFeed("Checkout cancelled.");
+}
+if (checkoutState) {
+  const cleaned = new URL(window.location.href);
+  cleaned.searchParams.delete("checkout");
+  window.history.replaceState({}, "", cleaned.toString());
+}
