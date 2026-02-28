@@ -16,6 +16,7 @@ const state = {
   avatarCatalogLoaded: false,
   avatarCatalog: [],
   pendingAvatarId: "",
+  gameModes: [],
   roundSeconds: 120,
   voteSeconds: 120,
   blackoutUntil: 0,
@@ -57,6 +58,10 @@ const dom = {
   lobbyStatus: document.getElementById("lobbyStatus"),
   codeChip: document.getElementById("codeChip"),
   lobbyHint: document.getElementById("lobbyHint"),
+  metaMode: document.getElementById("metaMode"),
+  metaTiebreaker: document.getElementById("metaTiebreaker"),
+  modeOptions: document.getElementById("modeOptions"),
+  modeHint: document.getElementById("modeHint"),
   lobbyPlayersGrid: document.getElementById("lobbyPlayersGrid"),
   lobbyScoreboard: document.getElementById("lobbyScoreboard"),
 
@@ -65,9 +70,11 @@ const dom = {
   phaseLabel: document.getElementById("phaseLabel"),
   promptStatus: document.getElementById("promptStatus"),
   promptPhaseNote: document.getElementById("promptPhaseNote"),
+  referenceTitle: document.getElementById("referenceTitle"),
 
   sabotageToast: document.getElementById("sabotageToast"),
   referenceImg: document.getElementById("referenceImg"),
+  referencePromptOnly: document.getElementById("referencePromptOnly"),
   referencePrompt: document.getElementById("referencePrompt"),
   blackoutOverlay: document.getElementById("blackoutOverlay"),
   promptInput: document.getElementById("promptInput"),
@@ -76,6 +83,8 @@ const dom = {
   scoreboardList: document.getElementById("scoreboardList"),
 
   voteTimerLabel: document.getElementById("voteTimerLabel"),
+  votePromptCard: document.getElementById("votePromptCard"),
+  votePromptText: document.getElementById("votePromptText"),
   voteGallery: document.getElementById("voteGallery"),
   voteStatus: document.getElementById("voteStatus"),
 
@@ -85,6 +94,7 @@ const dom = {
   showcasePanels: document.getElementById("showcasePanels"),
   showcaseEntryCard: document.getElementById("showcaseEntryCard"),
   showcaseReferenceImg: document.getElementById("showcaseReferenceImg"),
+  showcaseReferencePromptOnly: document.getElementById("showcaseReferencePromptOnly"),
   showcaseReferencePrompt: document.getElementById("showcaseReferencePrompt"),
   showcaseEntryLabel: document.getElementById("showcaseEntryLabel"),
   showcaseEntryImg: document.getElementById("showcaseEntryImg"),
@@ -98,8 +108,10 @@ const dom = {
   winnerPromptText: document.getElementById("winnerPromptText"),
   runnerName: document.getElementById("runnerName"),
   runnerMetric: document.getElementById("runnerMetric"),
+  allPromptsList: document.getElementById("allPromptsList"),
   resultsTableBody: document.getElementById("resultsTableBody"),
   resultsReferencePrompt: document.getElementById("resultsReferencePrompt"),
+  resultsReferenceThumb: document.getElementById("resultsReferenceThumb"),
   resultsReferenceImg: document.getElementById("resultsReferenceImg"),
   intermissionLabel: document.getElementById("intermissionLabel"),
 
@@ -131,6 +143,39 @@ function currentSelf() {
 
 function isHost() {
   return Boolean(state.room && state.room.self.id === state.room.hostId);
+}
+
+const DEFAULT_GAME_MODES = [
+  {
+    id: "classic",
+    label: "Classic Slop Battle",
+    description: "Reference image + sabotage powerups"
+  },
+  {
+    id: "humanity",
+    label: "AI Slop Against Humanity",
+    description: "One black-card prompt. No sabotage."
+  }
+];
+
+function modeCatalog() {
+  if (Array.isArray(state.gameModes) && state.gameModes.length) {
+    return state.gameModes;
+  }
+  return DEFAULT_GAME_MODES;
+}
+
+function currentModeId() {
+  return String(state.room?.modeId || "classic");
+}
+
+function isHumanityMode() {
+  return currentModeId() === "humanity";
+}
+
+function currentModeMeta() {
+  const modeId = currentModeId();
+  return modeCatalog().find((mode) => mode.id === modeId) || DEFAULT_GAME_MODES[0];
 }
 
 function sortedPlayers() {
@@ -272,7 +317,9 @@ function setVisibleScreen(screen) {
 
 function loadingMessage() {
   const phase = state.room?.phase;
-  if (phase === "starting") return "Mixing reference mayhem...";
+  if (phase === "starting") {
+    return isHumanityMode() ? "Shuffling black-card mayhem..." : "Mixing reference mayhem...";
+  }
   if (phase === "generating") return "Pixel goblins are painting masterpieces...";
   return "";
 }
@@ -366,11 +413,59 @@ function renderAvatarSelection() {
   }
 }
 
+function renderModeOptions() {
+  if (!state.room) return;
+
+  const selectedModeId = currentModeId();
+  const canChange = isHost() && (state.room.phase === "lobby" || state.room.phase === "ended");
+  const modes = modeCatalog();
+
+  dom.modeOptions.innerHTML = "";
+  modes.forEach((mode) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mode-option";
+    if (mode.id === selectedModeId) {
+      button.classList.add("selected");
+    }
+    button.disabled = !canChange;
+
+    const title = document.createElement("div");
+    title.className = "mode-option-title";
+    title.textContent = mode.label || mode.id;
+
+    const desc = document.createElement("div");
+    desc.className = "mode-option-desc";
+    desc.textContent = mode.description || "";
+
+    button.appendChild(title);
+    button.appendChild(desc);
+
+    button.addEventListener("click", () => {
+      if (!canChange) return;
+      socket.emit("setGameMode", { modeId: mode.id });
+    });
+
+    dom.modeOptions.appendChild(button);
+  });
+
+  if (canChange) {
+    dom.modeHint.textContent = "Host can switch mode before starting.";
+  } else if (isHost()) {
+    dom.modeHint.textContent = "Mode locked while the match is in progress.";
+  } else {
+    dom.modeHint.textContent = "Only the host can change mode.";
+  }
+}
+
 function renderLobby() {
   if (!state.room) return;
 
   dom.lobbyTitle.textContent = `Room #${state.room.roomId}`;
   dom.codeChip.textContent = `CODE: ${state.room.roomId}`;
+  const modeMeta = currentModeMeta();
+  dom.metaMode.textContent = modeMeta.label || modeMeta.id;
+  dom.metaTiebreaker.textContent = isHumanityMode() ? "Sudden-death rematch" : "Chaos + double powerups";
 
   const playerCount = state.room.players.length;
   if (state.room.phase === "starting") {
@@ -378,7 +473,7 @@ function renderLobby() {
   } else if (playerCount < 2) {
     dom.lobbyStatus.textContent = "Waiting for more players to join...";
   } else {
-    dom.lobbyStatus.textContent = `${playerCount} players in room. Ready to start.`;
+    dom.lobbyStatus.textContent = `${playerCount} players in room. Mode: ${modeMeta.label}.`;
   }
 
   dom.lobbyPlayersGrid.innerHTML = "";
@@ -397,7 +492,9 @@ function renderLobby() {
     const meta = document.createElement("div");
     meta.className = "player-meta";
     const role = player.id === state.room.hostId ? "Host" : "Player";
-    meta.textContent = `${role} | Score ${player.score} | Powerups ${player.powerupCount}`;
+    meta.textContent = isHumanityMode()
+      ? `${role} | Score ${player.score}`
+      : `${role} | Score ${player.score} | Powerups ${player.powerupCount}`;
 
     card.appendChild(head);
     card.appendChild(meta);
@@ -433,6 +530,8 @@ function renderLobby() {
   } else {
     dom.lobbyHint.textContent = "Start when everyone is ready.";
   }
+
+  renderModeOptions();
 }
 
 function renderPromptScoreboard() {
@@ -448,7 +547,9 @@ function renderPromptScoreboard() {
     const right = document.createElement("span");
     right.className = "score-value";
     const submitted = player.submitted ? " | submitted" : "";
-    right.textContent = `${player.score}/${state.room.toWin} | powerups ${player.powerupCount}${submitted}`;
+    right.textContent = isHumanityMode()
+      ? `${player.score}/${state.room.toWin}${submitted}`
+      : `${player.score}/${state.room.toWin} | powerups ${player.powerupCount}${submitted}`;
 
     li.appendChild(left);
     li.appendChild(right);
@@ -533,6 +634,13 @@ function renderPowerups() {
   dom.powerupTray.innerHTML = "";
   const self = currentSelf();
   if (!self) return;
+  if (isHumanityMode()) {
+    const msg = document.createElement("p");
+    msg.className = "muted small";
+    msg.textContent = "Powerups disabled in this mode.";
+    dom.powerupTray.appendChild(msg);
+    return;
+  }
 
   const phase = state.room?.phase;
   const disabledGlobal = phase !== "round" || self.submitted;
@@ -585,10 +693,12 @@ function renderPrompt() {
 
   const self = currentSelf();
   if (!self) return;
+  const humanityMode = isHumanityMode();
 
   dom.roundLabel.textContent = String(state.room.roundNumber || 0);
   dom.timerLabel.textContent = formatTimer(state.roundSeconds);
   dom.phaseLabel.textContent = phaseLabel(state.room.phase);
+  dom.referenceTitle.textContent = humanityMode ? "Black Card Prompt" : "Target Reference";
 
   const submittedCount = state.room.players.filter((p) => p.submitted).length;
   dom.promptStatus.textContent = `${submittedCount}/${state.room.players.length} submitted`;
@@ -602,8 +712,21 @@ function renderPrompt() {
     dom.promptPhaseNote.textContent = "";
   }
 
-  setImageSource(dom.referenceImg, state.reference.url, "Reference");
-  dom.referencePrompt.textContent = state.reference.promptLabel || "Reference prompt hidden until round end.";
+  if (humanityMode) {
+    dom.referenceImg.classList.add("hidden");
+    dom.referencePromptOnly.classList.remove("hidden");
+    dom.referencePromptOnly.textContent = state.reference.promptLabel || "Black card prompt loading...";
+    dom.referencePrompt.textContent = "Write an image prompt that lands this black card.";
+    dom.blackoutOverlay.classList.add("hidden");
+    dom.promptInput.placeholder = "Write your image prompt response to the black card...";
+  } else {
+    dom.referenceImg.classList.remove("hidden");
+    dom.referencePromptOnly.classList.add("hidden");
+    setImageSource(dom.referenceImg, state.reference.url, "Reference");
+    dom.referencePrompt.textContent =
+      state.reference.promptLabel || "Reference prompt hidden until round end.";
+    dom.promptInput.placeholder = "Describe the reference image in detail";
+  }
 
   const disablePrompt = state.room.phase !== "round" || self.submitted;
   dom.promptInput.disabled = disablePrompt;
@@ -720,13 +843,24 @@ function renderShowcase() {
   dom.showcaseTimerLabel.textContent = formatTimer(Math.ceil(progress.remainingMs / 1000));
 
   const referencePrompt = String(state.showcase?.reference?.prompt || "");
-  setImageSource(dom.showcaseReferenceImg, state.showcase?.reference?.url, "Reference image");
+  const promptOnly = Boolean(state.showcase?.reference?.promptOnly) || isHumanityMode();
+  if (promptOnly) {
+    dom.showcaseReferenceImg.classList.add("hidden");
+    dom.showcaseReferencePromptOnly.classList.remove("hidden");
+    dom.showcaseReferencePromptOnly.textContent = referencePrompt || "Black card prompt loading...";
+  } else {
+    dom.showcaseReferenceImg.classList.remove("hidden");
+    dom.showcaseReferencePromptOnly.classList.add("hidden");
+    setImageSource(dom.showcaseReferenceImg, state.showcase?.reference?.url, "Reference image");
+  }
 
   if (progress.inReference) {
     dom.showcasePanels.classList.add("reference-only");
     dom.showcaseEntryCard.classList.add("hidden");
-    dom.showcaseStepLabel.textContent = "Reference Reveal";
-    dom.showcaseStatus.textContent = "Memorize the target. Slop cinema starts in a moment.";
+    dom.showcaseStepLabel.textContent = promptOnly ? "Black Card Reveal" : "Reference Reveal";
+    dom.showcaseStatus.textContent = promptOnly
+      ? "Read it closely. Slop cinema starts in a moment."
+      : "Memorize the target. Slop cinema starts in a moment.";
     dom.showcaseReferencePrompt.textContent = typewriterText(
       referencePrompt,
       progress.elapsedMs,
@@ -740,7 +874,9 @@ function renderShowcase() {
   dom.showcaseEntryCard.classList.remove("hidden");
   const entry = progress.entry || {};
   dom.showcaseStepLabel.textContent = `Comparison ${progress.entryIndex + 1}/${progress.totalEntries}`;
-  dom.showcaseStatus.textContent = "Anonymous masterpiece showcase. Voting opens when the curtain falls.";
+  dom.showcaseStatus.textContent = promptOnly
+    ? "Anonymous entries versus the black card. Voting opens when the curtain falls."
+    : "Anonymous masterpiece showcase. Voting opens when the curtain falls.";
   dom.showcaseReferencePrompt.textContent = referencePrompt;
 
   dom.showcaseEntryLabel.textContent = `Entry ${progress.entryIndex + 1}`;
@@ -845,36 +981,45 @@ function renderVote() {
 
   if (!reveal || !reveal.reference || !Array.isArray(reveal.submissions)) {
     dom.voteStatus.textContent = "Waiting for images to finish generating...";
+    dom.votePromptCard.classList.add("hidden");
     return;
   }
 
-  const refCard = document.createElement("article");
-  refCard.className = "vote-card reference";
+  const promptOnly = Boolean(reveal.reference.promptOnly) || isHumanityMode();
+  dom.votePromptCard.classList.toggle("hidden", !promptOnly);
+  if (promptOnly) {
+    dom.votePromptText.textContent = reveal.reference.prompt || "Black card prompt unavailable.";
+  }
 
-  const refImg = document.createElement("img");
-  refImg.className = "vote-image";
-  setImageSource(refImg, reveal.reference.url, "Reference image");
-  refImg.addEventListener("click", () => {
-    openImageLightbox(reveal.reference.url, "Reference");
-  });
+  if (!promptOnly) {
+    const refCard = document.createElement("article");
+    refCard.className = "vote-card reference";
 
-  const refBody = document.createElement("div");
-  refBody.className = "vote-body";
+    const refImg = document.createElement("img");
+    refImg.className = "vote-image";
+    setImageSource(refImg, reveal.reference.url, "Reference image");
+    refImg.addEventListener("click", () => {
+      openImageLightbox(reveal.reference.url, "Reference");
+    });
 
-  const refName = document.createElement("div");
-  refName.className = "vote-player";
-  refName.textContent = "Reference";
+    const refBody = document.createElement("div");
+    refBody.className = "vote-body";
 
-  const refNote = document.createElement("div");
-  refNote.className = "vote-count";
-  refNote.textContent = "Target image";
+    const refName = document.createElement("div");
+    refName.className = "vote-player";
+    refName.textContent = "Reference";
 
-  refBody.appendChild(refName);
-  refBody.appendChild(refNote);
-  refCard.appendChild(refImg);
-  refCard.appendChild(refBody);
+    const refNote = document.createElement("div");
+    refNote.className = "vote-count";
+    refNote.textContent = "Target image";
 
-  dom.voteGallery.appendChild(refCard);
+    refBody.appendChild(refName);
+    refBody.appendChild(refNote);
+    refCard.appendChild(refImg);
+    refCard.appendChild(refBody);
+
+    dom.voteGallery.appendChild(refCard);
+  }
 
   const canVote = state.room.phase === "voting";
   const selfId = state.room.self.id;
@@ -900,7 +1045,7 @@ function scoreMetricFor(playerId) {
   if (!state.result || !Array.isArray(state.result.submissions)) return "";
   const entry = state.result.submissions.find((sub) => sub.playerId === playerId);
   if (!entry) return "";
-  if (state.room && state.room.players.length === 2) {
+  if (state.room && state.room.players.length === 2 && !isHumanityMode()) {
     return Number.isFinite(entry.score) ? `${entry.score}% similarity` : "Similarity pending";
   }
   return `${entry.votes || 0} votes`;
@@ -918,7 +1063,7 @@ function renderResults() {
   const winnerIds = Array.isArray(state.result?.winnerIds) ? state.result.winnerIds : [];
 
   const rankedByRound = submissions.sort((a, b) => {
-    if (state.room.players.length === 2) {
+    if (state.room.players.length === 2 && !isHumanityMode()) {
       return (Number(b.score) || 0) - (Number(a.score) || 0);
     }
     return (Number(b.votes) || 0) - (Number(a.votes) || 0);
@@ -939,7 +1084,9 @@ function renderResults() {
       : "Match ended.";
   } else if (state.result?.tie) {
     dom.resultTitle.textContent = `Round ${state.room.roundNumber} Tied`;
-    dom.resultSubtitle.textContent = "Chaos tiebreaker next round with double powerups.";
+    dom.resultSubtitle.textContent = isHumanityMode()
+      ? "Tiebreaker next round."
+      : "Chaos tiebreaker next round with double powerups.";
   } else {
     dom.resultTitle.textContent = `Round ${state.room.roundNumber} Results`;
     const roundWinner = (roundWinnerId && board.find((player) => player.id === roundWinnerId)) || winner;
@@ -962,6 +1109,34 @@ function renderResults() {
     dom.winnerPromptText.textContent = "No winner prompt to reveal for this round.";
   } else {
     dom.winnerPromptText.textContent = winnerSubmission.prompt;
+  }
+
+  dom.allPromptsList.innerHTML = "";
+  if (!submissions.length) {
+    const empty = document.createElement("li");
+    empty.className = "all-prompt-empty";
+    empty.textContent = "No prompts submitted this round.";
+    dom.allPromptsList.appendChild(empty);
+  } else {
+    submissions.forEach((submission, idx) => {
+      const item = document.createElement("li");
+      item.className = "all-prompt-item";
+
+      const header = document.createElement("div");
+      header.className = "all-prompt-header";
+      const player = playerById(submission.playerId);
+      const name = player?.name || submission.playerName || `Player ${idx + 1}`;
+      const metric = scoreMetricFor(submission.playerId);
+      header.textContent = `${idx + 1}. ${name}${metric ? ` | ${metric}` : ""}`;
+
+      const text = document.createElement("p");
+      text.className = "all-prompt-text";
+      text.textContent = submission.prompt || "(empty prompt)";
+
+      item.appendChild(header);
+      item.appendChild(text);
+      dom.allPromptsList.appendChild(item);
+    });
   }
 
   dom.runnerName.innerHTML = "";
@@ -1003,8 +1178,12 @@ function renderResults() {
   const promptText = state.result?.reference?.prompt || state.reference.promptLabel || "Reference prompt not available.";
   dom.resultsReferencePrompt.textContent = promptText;
 
-  const imageUrl = state.result?.reference?.url || state.reference.url;
-  setImageSource(dom.resultsReferenceImg, imageUrl, "Reference");
+  const promptOnlyReference = Boolean(state.result?.reference?.promptOnly) || isHumanityMode();
+  dom.resultsReferenceThumb.classList.toggle("hidden", promptOnlyReference);
+  if (!promptOnlyReference) {
+    const imageUrl = state.result?.reference?.url || state.reference.url;
+    setImageSource(dom.resultsReferenceImg, imageUrl, "Reference");
+  }
 
   const inReadyUp = state.room.phase === "intermission";
   const readyCount = state.room.players.filter((player) => player.readyForNextRound).length;
@@ -1019,7 +1198,11 @@ function renderResults() {
   dom.backToLobbyBtn.classList.toggle("hidden", !(state.room.phase === "ended" && isHost()));
 
   if (inReadyUp) {
-    const chaosSuffix = state.room.tiebreakerNextRound ? " Chaos tiebreaker is queued." : "";
+    const chaosSuffix = state.room.tiebreakerNextRound
+      ? isHumanityMode()
+        ? " Tiebreaker is queued."
+        : " Chaos tiebreaker is queued."
+      : "";
     dom.intermissionLabel.textContent = `Ready check: ${readyCount}/${readyTotal}.${chaosSuffix}`;
   } else if (state.room.phase === "ended") {
     dom.intermissionLabel.textContent = isHost()
@@ -1031,6 +1214,10 @@ function renderResults() {
 }
 
 function updateBlackoutOverlay() {
+  if (isHumanityMode()) {
+    dom.blackoutOverlay.classList.add("hidden");
+    return;
+  }
   const hidden = Date.now() < state.blackoutUntil;
   dom.blackoutOverlay.classList.toggle("hidden", !hidden);
 }
@@ -1169,6 +1356,7 @@ socket.on("avatarCatalog", (payload) => {
 socket.on("roomSnapshot", (payload) => {
   const prevPhase = state.room?.phase;
   state.room = payload;
+  state.gameModes = Array.isArray(payload?.gameModes) ? payload.gameModes : state.gameModes;
 
   if (payload?.self?.avatarId) {
     state.pendingAvatarId = "";
@@ -1187,7 +1375,11 @@ socket.on("roundStarted", (payload) => {
   resetRoundTransientState();
 
   state.reference.url = payload.referenceUrl;
-  state.reference.promptLabel = "Reference prompt hidden until round end.";
+  if (payload.promptVisible) {
+    state.reference.promptLabel = payload.referencePrompt || "Black card prompt unavailable.";
+  } else {
+    state.reference.promptLabel = "Reference prompt hidden until round end.";
+  }
   state.roundSeconds = Number(payload.seconds) || 120;
 
   if (payload.chaosRound) {
@@ -1242,6 +1434,9 @@ socket.on("revealReady", (payload) => {
   if (payload?.reference?.url) {
     state.reference.url = payload.reference.url;
   }
+  if (payload?.reference?.prompt && isHumanityMode()) {
+    state.reference.promptLabel = payload.reference.prompt;
+  }
   renderAll();
 });
 
@@ -1257,6 +1452,16 @@ socket.on("showcasePhase", (payload) => {
 socket.on("votePhase", (payload) => {
   if (state.room) {
     state.room.phase = "voting";
+  }
+  if (payload?.reference) {
+    if (!state.reveal) {
+      state.reveal = {
+        reference: payload.reference,
+        submissions: []
+      };
+    } else {
+      state.reveal.reference = payload.reference;
+    }
   }
   state.showcase = null;
   state.showcaseStageKey = "";
@@ -1291,13 +1496,16 @@ socket.on("roundResult", (payload) => {
   state.result = payload;
   state.showcase = null;
   state.showcaseStageKey = "";
-  state.reference.promptLabel = `Reference prompt: ${payload.reference.prompt}`;
+  state.reference.promptLabel = isHumanityMode()
+    ? payload.reference.prompt
+    : `Reference prompt: ${payload.reference.prompt}`;
   if (payload.reference.url) {
     state.reference.url = payload.reference.url;
   }
 
   if (payload.tie) {
-    pushFeed(`Round tied (${payload.reason}). Chaos tiebreaker queued.`, true);
+    const tieLabel = isHumanityMode() ? "Tiebreaker queued." : "Chaos tiebreaker queued.";
+    pushFeed(`Round tied (${payload.reason}). ${tieLabel}`, true);
   } else {
     const winner = payload.leaderboard.find((player) => payload.winnerIds.includes(player.id));
     pushFeed(`Round winner: ${winner ? winner.name : "Unknown"}.`);
@@ -1312,6 +1520,8 @@ socket.on("readyUpStarted", (payload) => {
   }
   if (payload?.chaosRound) {
     pushFeed("Chaos tiebreaker round is queued. Everyone click ready to proceed.", true);
+  } else if (payload?.tiebreakerRound) {
+    pushFeed("Tiebreaker round is queued. Everyone click ready to proceed.", true);
   } else {
     pushFeed("Round complete. Click ready when you want to continue.");
   }

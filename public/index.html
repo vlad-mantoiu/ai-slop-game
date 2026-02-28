@@ -65,6 +65,12 @@
 
             <div id="lobbyPlayersGrid" class="players-grid"></div>
 
+            <div class="mode-picker">
+              <p class="kicker">Game Mode</p>
+              <div id="modeOptions" class="mode-options"></div>
+              <p id="modeHint" class="muted small"></p>
+            </div>
+
             <div class="lobby-cta">
               <button id="startBtn" class="btn btn-primary btn-large">Start Match</button>
               <p id="lobbyHint" class="muted center"></p>
@@ -76,8 +82,9 @@
             <ul class="meta-list">
               <li><span>Players</span><strong>2-6</strong></li>
               <li><span>Round Timer</span><strong>120s</strong></li>
+              <li><span>Mode</span><strong id="metaMode">Classic Slop Battle</strong></li>
               <li><span>Win Condition</span><strong>First to 5</strong></li>
-              <li><span>Tiebreaker</span><strong>Chaos + double powerups</strong></li>
+              <li><span>Tiebreaker</span><strong id="metaTiebreaker">Chaos + double powerups</strong></li>
             </ul>
             <h4>Current Scores</h4>
             <ul id="lobbyScoreboard" class="list"></ul>
@@ -103,11 +110,12 @@
         <div class="prompt-layout">
           <article class="card reference-card">
             <div class="row between compact">
-              <h3>Target Reference</h3>
+              <h3 id="referenceTitle">Target Reference</h3>
               <span id="promptStatus" class="muted"></span>
             </div>
             <div class="reference-wrap">
               <img id="referenceImg" alt="Reference" />
+              <div id="referencePromptOnly" class="reference-prompt-only hidden"></div>
               <div id="blackoutOverlay" class="overlay hidden">Reference hidden by sabotage</div>
             </div>
             <p id="referencePrompt" class="muted small"></p>
@@ -154,6 +162,7 @@
             </div>
             <div class="showcase-image-wrap">
               <img id="showcaseReferenceImg" alt="Reference image" />
+              <div id="showcaseReferencePromptOnly" class="showcase-prompt-only hidden"></div>
             </div>
             <p id="showcaseReferencePrompt" class="showcase-prompt"></p>
           </article>
@@ -182,6 +191,11 @@
             <p class="muted">No self-vote. One vote per player.</p>
           </div>
           <div class="timer-chip" id="voteTimerLabel">02:00</div>
+        </article>
+
+        <article id="votePromptCard" class="card vote-prompt-card hidden">
+          <p class="kicker">Black Card</p>
+          <p id="votePromptText" class="vote-prompt-text"></p>
         </article>
 
         <div id="voteGallery" class="vote-grid"></div>
@@ -213,6 +227,14 @@
           <p id="winnerPromptText" class="winner-prompt-text">Prompt will appear after winner reveal.</p>
         </article>
 
+        <article class="card all-prompts-card">
+          <div class="row between compact">
+            <h3>All Submitted Prompts</h3>
+            <span class="muted small">Round reveal</span>
+          </div>
+          <ul id="allPromptsList" class="all-prompts-list"></ul>
+        </article>
+
         <article class="card">
           <div class="row between compact">
             <h3>Leaderboard</h3>
@@ -235,7 +257,7 @@
             <h3>Reference Prompt Revealed</h3>
             <p id="resultsReferencePrompt" class="muted"></p>
           </div>
-          <div class="thumb-wrap">
+          <div id="resultsReferenceThumb" class="thumb-wrap">
             <img id="resultsReferenceImg" alt="Reference" />
           </div>
         </article>

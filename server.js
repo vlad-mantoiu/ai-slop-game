@@ -26,6 +26,22 @@ const OPENAI_IMAGE_QUALITY = String(process.env.OPENAI_IMAGE_QUALITY || "low").t
 const IMAGE_PROVIDER = String(
   process.env.IMAGE_PROVIDER || (OPENAI_API_KEY ? "openai" : "pollinations")
 ).trim().toLowerCase();
+const BLACK_CARD_PROMPT_FILE = path.join(__dirname, "data", "against-humanity-prompts.json");
+
+const GAME_MODES = {
+  classic: {
+    id: "classic",
+    label: "Classic Slop Battle",
+    description: "Reference image + sabotage powerups"
+  },
+  humanity: {
+    id: "humanity",
+    label: "AI Slop Against Humanity",
+    description: "One black-card prompt. No sabotage."
+  }
+};
+
+const GAME_MODE_IDS = Object.keys(GAME_MODES);
 
 const rooms = new Map();
 const socketToRoom = new Map();
@@ -185,6 +201,24 @@ function loadAvatarCatalog() {
 const AVATAR_CATALOG = loadAvatarCatalog();
 const AVATAR_BY_ID = new Map(AVATAR_CATALOG.map((avatar) => [avatar.id, avatar]));
 
+function loadBlackCardPromptCatalog() {
+  try {
+    const raw = fs.readFileSync(BLACK_CARD_PROMPT_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    const cleaned = parsed
+      .map((value) => sanitizePrompt(value))
+      .filter(Boolean);
+    return [...new Set(cleaned)];
+  } catch {
+    return [];
+  }
+}
+
+const BLACK_CARD_PROMPT_CATALOG = loadBlackCardPromptCatalog();
+
 function rand(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -290,6 +324,11 @@ function resetSessionPromptPool(room) {
   room.sessionPromptIndex = 0;
 }
 
+function resetBlackCardPromptPool(room) {
+  room.blackCardPromptPool = shuffle(BLACK_CARD_PROMPT_CATALOG);
+  room.blackCardPromptIndex = 0;
+}
+
 function nextReferencePrompt(room) {
   if (!Array.isArray(room.sessionPromptPool) || room.sessionPromptPool.length === 0) {
     resetSessionPromptPool(room);
@@ -302,6 +341,29 @@ function nextReferencePrompt(room) {
   const prompt = room.sessionPromptPool[room.sessionPromptIndex];
   room.sessionPromptIndex += 1;
   return prompt || makeReferencePrompt();
+}
+
+function nextBlackCardPrompt(room) {
+  if (!Array.isArray(room.blackCardPromptPool) || room.blackCardPromptPool.length === 0) {
+    resetBlackCardPromptPool(room);
+  }
+
+  if (room.blackCardPromptIndex >= room.blackCardPromptPool.length) {
+    resetBlackCardPromptPool(room);
+  }
+
+  const prompt = room.blackCardPromptPool[room.blackCardPromptIndex];
+  room.blackCardPromptIndex += 1;
+  return prompt || "Describe the exact crime scene vibe this prompt implies.";
+}
+
+function validModeId(value) {
+  const modeId = String(value || "").trim().toLowerCase();
+  return GAME_MODE_IDS.includes(modeId) ? modeId : "classic";
+}
+
+function modeSupportsPowerups(room) {
+  return room?.modeId === "classic";
 }
 
 async function fetchImageBuffer(url, retries = 3) {
@@ -429,6 +491,8 @@ function resetRoomForImageFailure(room, context, error) {
   room.startingNextRound = false;
   room.sessionPromptPool = [];
   room.sessionPromptIndex = 0;
+  room.blackCardPromptPool = [];
+  room.blackCardPromptIndex = 0;
   room.submissions = new Map();
   room.revealOrder = [];
   room.votes = new Map();
@@ -557,6 +621,8 @@ function emitRoomSnapshot(room) {
       phase: room.phase,
       roundNumber: room.roundNumber,
       toWin: TO_WIN,
+      modeId: room.modeId || "classic",
+      gameModes: GAME_MODE_IDS.map((id) => GAME_MODES[id]),
       tiebreakerNextRound: room.tiebreakerNextRound,
       players: allPlayers.map((p) => playerPublic(p, viewer.id)),
       self: {
@@ -742,7 +808,9 @@ function beginReadyUp(room) {
 
   emitRoomSnapshot(room);
   io.to(room.id).emit("readyUpStarted", {
-    chaosRound: room.tiebreakerNextRound,
+    modeId: room.modeId,
+    chaosRound: modeSupportsPowerups(room) && room.tiebreakerNextRound,
+    tiebreakerRound: room.tiebreakerNextRound,
     totalPlayers: room.players.size
   });
 }
@@ -754,6 +822,10 @@ async function startRound(room) {
     return;
   }
 
+  const modeId = validModeId(room.modeId);
+  room.modeId = modeId;
+  const powerupsEnabled = modeSupportsPowerups(room);
+
   clearRoomTimers(room);
   room.roundNumber += 1;
   room.phase = "round";
@@ -761,7 +833,7 @@ async function startRound(room) {
   room.revealOrder = [];
   room.votes = new Map();
 
-  const chaosRound = room.tiebreakerNextRound;
+  const chaosRound = powerupsEnabled && room.tiebreakerNextRound;
   room.tiebreakerNextRound = false;
 
   const grants = {};
@@ -774,12 +846,17 @@ async function startRound(room) {
     player.effects.lockUntil = 0;
     player.sabotageHistory = [];
     player.sabotageEvents = [];
+    if (!powerupsEnabled) {
+      player.powerups = [];
+    }
 
     let count = 0;
-    if (chaosRound) {
-      count = 2;
-    } else if (room.roundNumber % 2 === 0) {
-      count = 1;
+    if (powerupsEnabled) {
+      if (chaosRound) {
+        count = 2;
+      } else if (room.roundNumber % 2 === 0) {
+        count = 1;
+      }
     }
 
     if (count > 0) {
@@ -787,22 +864,33 @@ async function startRound(room) {
     }
   }
 
-  const refPrompt = nextReferencePrompt(room);
-  const seed = Math.floor(Math.random() * 1_000_000_000);
-  let ref;
-  try {
-    ref = await generateGameImage(refPrompt, seed);
-  } catch (error) {
-    resetRoomForImageFailure(room, "reference generation", error);
-    return;
-  }
+  if (modeId === "humanity") {
+    room.reference = {
+      prompt: nextBlackCardPrompt(room),
+      url: "",
+      seed: 0,
+      provider: "prompt-only",
+      promptOnly: true
+    };
+  } else {
+    const refPrompt = nextReferencePrompt(room);
+    const seed = Math.floor(Math.random() * 1_000_000_000);
+    let ref;
+    try {
+      ref = await generateGameImage(refPrompt, seed);
+    } catch (error) {
+      resetRoomForImageFailure(room, "reference generation", error);
+      return;
+    }
 
-  room.reference = {
-    prompt: refPrompt,
-    url: ref.url,
-    seed,
-    provider: ref.provider
-  };
+    room.reference = {
+      prompt: refPrompt,
+      url: ref.url,
+      seed,
+      provider: ref.provider,
+      promptOnly: false
+    };
+  }
 
   room.roundEndsAt = Date.now() + ROUND_SECONDS * 1000;
   emitRoomSnapshot(room);
@@ -810,6 +898,9 @@ async function startRound(room) {
   io.to(room.id).emit("roundStarted", {
     roundNumber: room.roundNumber,
     referenceUrl: room.reference.url,
+    referencePrompt: room.reference.prompt,
+    promptVisible: modeId === "humanity",
+    modeId,
     seconds: ROUND_SECONDS,
     chaosRound,
     grants
@@ -895,16 +986,18 @@ async function lockRound(roomId, reason) {
   room.revealOrder = shuffle([...room.submissions.keys()]);
 
   const revealPayload = {
+    modeId: room.modeId,
     reference: {
       url: room.reference.url,
-      prompt: room.reference.prompt
+      prompt: room.reference.prompt,
+      promptOnly: Boolean(room.reference.promptOnly)
     },
     submissions: orderedSubmissions(room)
   };
 
   io.to(room.id).emit("revealReady", revealPayload);
 
-  if (room.players.size === 2) {
+  if (room.modeId === "classic" && room.players.size === 2) {
     await scoreDuel(room);
   } else {
     startShowcasePhase(room);
@@ -975,8 +1068,14 @@ function startVotePhase(room) {
   emitRoomSnapshot(room);
 
   io.to(room.id).emit("votePhase", {
+    modeId: room.modeId,
     seconds: VOTE_SECONDS,
     requiredVotes: room.players.size,
+    reference: {
+      url: room.reference?.url || "",
+      prompt: room.reference?.prompt || "",
+      promptOnly: Boolean(room.reference?.promptOnly)
+    },
     candidates: orderedSubmissions(room).map((s) => ({
       playerId: s.playerId,
       playerName: s.playerName,
@@ -1017,12 +1116,14 @@ function startShowcasePhase(room) {
 
   emitRoomSnapshot(room);
   io.to(room.id).emit("showcasePhase", {
+    modeId: room.modeId,
     startedAt,
     referenceSeconds,
     entrySeconds,
     reference: {
       url: room.reference.url,
-      prompt: room.reference.prompt
+      prompt: room.reference.prompt,
+      promptOnly: Boolean(room.reference.promptOnly)
     },
     entries: entries.map((entry) => ({
       playerId: entry.playerId,
@@ -1152,12 +1253,15 @@ function createRoom(socket, name) {
     players: new Map(),
     phase: "lobby",
     roundNumber: 0,
+    modeId: "classic",
     tiebreakerNextRound: false,
     submissions: new Map(),
     revealOrder: [],
     votes: new Map(),
     sessionPromptPool: [],
     sessionPromptIndex: 0,
+    blackCardPromptPool: [],
+    blackCardPromptIndex: 0,
     reference: null,
     roundTickTimer: null,
     voteTickTimer: null,
@@ -1235,9 +1339,12 @@ function leaveCurrentRoom(socket) {
     room.startingNextRound = false;
     room.sessionPromptPool = [];
     room.sessionPromptIndex = 0;
+    room.blackCardPromptPool = [];
+    room.blackCardPromptIndex = 0;
     room.submissions = new Map();
     room.revealOrder = [];
     room.votes = new Map();
+    room.reference = null;
     io.to(room.id).emit("systemMessage", {
       message: "Not enough players to continue. Match reset to lobby."
     });
@@ -1255,6 +1362,12 @@ function usePowerup(socket, payload) {
   if (!roomId) return;
   const room = rooms.get(roomId);
   if (!room || room.phase !== "round") return;
+  if (!modeSupportsPowerups(room)) {
+    io.to(socket.id).emit("errorMessage", {
+      message: "Powerups are disabled in this game mode."
+    });
+    return;
+  }
 
   const actor = room.players.get(socket.id);
   if (!actor || actor.submitted) return;
@@ -1434,6 +1547,29 @@ io.on("connection", (socket) => {
     emitRoomSnapshot(room);
   });
 
+  socket.on("setGameMode", (payload) => {
+    const roomId = socketToRoom.get(socket.id);
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
+    if (room.hostId !== socket.id) {
+      io.to(socket.id).emit("errorMessage", { message: "Only the host can change game mode." });
+      return;
+    }
+    if (room.phase !== "lobby" && room.phase !== "ended") {
+      io.to(socket.id).emit("errorMessage", { message: "Game mode can only be changed in lobby." });
+      return;
+    }
+
+    const modeId = validModeId(payload?.modeId);
+    if (modeId === room.modeId) return;
+    room.modeId = modeId;
+    io.to(room.id).emit("systemMessage", {
+      message: `Game mode set to ${GAME_MODES[modeId].label}.`
+    });
+    emitRoomSnapshot(room);
+  });
+
   socket.on("startGame", async () => {
     const roomId = socketToRoom.get(socket.id);
     if (!roomId) return;
@@ -1461,6 +1597,14 @@ io.on("connection", (socket) => {
       }
     }
 
+    room.modeId = validModeId(room.modeId);
+    if (room.modeId === "humanity" && BLACK_CARD_PROMPT_CATALOG.length === 0) {
+      io.to(socket.id).emit("errorMessage", {
+        message: "No black-card prompts are available for this mode."
+      });
+      return;
+    }
+
     room.phase = "starting";
     room.roundNumber = 0;
     room.tiebreakerNextRound = false;
@@ -1469,7 +1613,16 @@ io.on("connection", (socket) => {
     room.submissions = new Map();
     room.revealOrder = [];
     room.votes = new Map();
-    resetSessionPromptPool(room);
+    room.reference = null;
+    if (room.modeId === "humanity") {
+      room.sessionPromptPool = [];
+      room.sessionPromptIndex = 0;
+      resetBlackCardPromptPool(room);
+    } else {
+      room.blackCardPromptPool = [];
+      room.blackCardPromptIndex = 0;
+      resetSessionPromptPool(room);
+    }
     for (const p of room.players.values()) {
       p.score = 0;
       p.readyForNextRound = false;
@@ -1587,9 +1740,12 @@ io.on("connection", (socket) => {
     room.startingNextRound = false;
     room.sessionPromptPool = [];
     room.sessionPromptIndex = 0;
+    room.blackCardPromptPool = [];
+    room.blackCardPromptIndex = 0;
     room.submissions = new Map();
     room.revealOrder = [];
     room.votes = new Map();
+    room.reference = null;
     for (const p of room.players.values()) {
       p.score = 0;
       p.readyForNextRound = false;
@@ -1618,4 +1774,6 @@ server.listen(PORT, () => {
   console.log(
     `Image provider mode=${IMAGE_PROVIDER}, OPENAI_API_KEY=${OPENAI_API_KEY ? "set" : "missing"}`
   );
+  // eslint-disable-next-line no-console
+  console.log(`Black-card prompt catalog loaded: ${BLACK_CARD_PROMPT_CATALOG.length}`);
 });
