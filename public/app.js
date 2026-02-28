@@ -229,6 +229,13 @@ const DEFAULT_GAME_MODES = [
   }
 ];
 
+const MODE_TOOLTIPS = {
+  classic:
+    "Classic: match the hidden reference image in 2 minutes. Sabotage and defense powerups are active. Winner gets the round point.",
+  humanity:
+    "Against Humanity: no reference image. Everyone answers one black-card prompt in 2 minutes. Anonymous group vote decides the winner."
+};
+
 function modeCatalog() {
   if (Array.isArray(state.gameModes) && state.gameModes.length) {
     return state.gameModes;
@@ -247,6 +254,11 @@ function isHumanityMode() {
 function currentModeMeta() {
   const modeId = currentModeId();
   return modeCatalog().find((mode) => mode.id === modeId) || DEFAULT_GAME_MODES[0];
+}
+
+function modeTooltipText(modeId) {
+  const id = String(modeId || "").trim();
+  return MODE_TOOLTIPS[id] || "Pick a mode to see how that match style plays.";
 }
 
 function sortedPlayers() {
@@ -564,6 +576,10 @@ function renderModeOptions() {
       button.classList.add("selected");
     }
     button.disabled = !canChange;
+    const tooltip = modeTooltipText(mode.id);
+    button.dataset.tooltip = tooltip;
+    button.setAttribute("title", tooltip);
+    button.setAttribute("aria-label", `${mode.label || mode.id}. ${tooltip}`);
 
     const title = document.createElement("div");
     title.className = "mode-option-title";

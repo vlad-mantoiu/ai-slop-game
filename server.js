@@ -61,6 +61,16 @@ const BILLING_STORE_FILE = path.join(__dirname, "data", "billing-store.json");
 const BILLING_COOKIE_NAME = "slop_uid";
 const IMAGE_COST_CENTS = Math.max(1, Number(process.env.IMAGE_COST_CENTS || 2));
 const FREE_PLAY_CENTS = Math.max(0, Number(process.env.FREE_PLAY_CENTS || 100));
+const DAILY_IMAGE_LIMIT_ACCOUNT = Math.max(0, Number(process.env.DAILY_IMAGE_LIMIT_ACCOUNT || 600));
+const DAILY_IMAGE_LIMIT_IP = Math.max(0, Number(process.env.DAILY_IMAGE_LIMIT_IP || 1200));
+const DAILY_IMAGE_LIMIT_FINGERPRINT = Math.max(
+  0,
+  Number(process.env.DAILY_IMAGE_LIMIT_FINGERPRINT || 900)
+);
+const DAILY_USAGE_RETENTION_DAYS = Math.max(
+  2,
+  Number(process.env.DAILY_USAGE_RETENTION_DAYS || 14)
+);
 const REQUIRE_LOGIN_FOR_CHECKOUT =
   String(process.env.REQUIRE_LOGIN_FOR_CHECKOUT || "true").trim().toLowerCase() !== "false";
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || "").trim();
@@ -397,6 +407,10 @@ function loadBillingStore() {
         parsed?.freeGrantFingerprints && typeof parsed.freeGrantFingerprints === "object"
           ? parsed.freeGrantFingerprints
           : {},
+      dailyImageUsage:
+        parsed?.dailyImageUsage && typeof parsed.dailyImageUsage === "object"
+          ? parsed.dailyImageUsage
+          : {},
       processedPayments:
         parsed?.processedPayments && typeof parsed.processedPayments === "object"
           ? parsed.processedPayments
@@ -410,6 +424,7 @@ function loadBillingStore() {
       users: {},
       freeGrantIps: {},
       freeGrantFingerprints: {},
+      dailyImageUsage: {},
       processedPayments: {},
       authByEmail: {},
       ledger: []
@@ -435,6 +450,227 @@ function appendLedger(entry) {
   if (billingStore.ledger.length > 6000) {
     billingStore.ledger = billingStore.ledger.slice(-6000);
   }
+}
+
+function utcDayKey(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+function usageDayKeyValid(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
+}
+
+function normalizeUsageKey(scope, value) {
+  if (scope === "accounts") return sanitizeUserId(value);
+  if (scope === "ips") return normalizeIp(value);
+  if (scope === "fingerprints") return sanitizeFingerprint(value);
+  return "";
+}
+
+function getUsageDay(dayKey, create = false) {
+  const key = String(dayKey || "").trim();
+  if (!usageDayKeyValid(key)) return null;
+
+  if (!billingStore.dailyImageUsage || typeof billingStore.dailyImageUsage !== "object") {
+    if (!create) return null;
+    billingStore.dailyImageUsage = {};
+  }
+
+  const existing = billingStore.dailyImageUsage[key];
+  if (!existing || typeof existing !== "object") {
+    if (!create) return null;
+    billingStore.dailyImageUsage[key] = {
+      accounts: {},
+      ips: {},
+      fingerprints: {}
+    };
+  } else {
+    if (!existing.accounts || typeof existing.accounts !== "object") {
+      existing.accounts = {};
+    }
+    if (!existing.ips || typeof existing.ips !== "object") {
+      existing.ips = {};
+    }
+    if (!existing.fingerprints || typeof existing.fingerprints !== "object") {
+      existing.fingerprints = {};
+    }
+  }
+
+  return billingStore.dailyImageUsage[key] || null;
+}
+
+function usageCount(dayStore, scope, keyRaw) {
+  if (!dayStore || typeof dayStore !== "object") return 0;
+  const key = normalizeUsageKey(scope, keyRaw);
+  if (!key) return 0;
+  const bucket = dayStore[scope];
+  return Math.max(0, Math.floor(Number(bucket?.[key]) || 0));
+}
+
+function adjustUsage(dayStore, scope, keyRaw, deltaRaw) {
+  const key = normalizeUsageKey(scope, keyRaw);
+  const delta = Math.floor(Number(deltaRaw) || 0);
+  if (!dayStore || !key || !delta) return false;
+  const bucket = dayStore[scope];
+  if (!bucket || typeof bucket !== "object") return false;
+  const current = Math.max(0, Math.floor(Number(bucket[key]) || 0));
+  const next = Math.max(0, current + delta);
+  if (next <= 0) {
+    if (Object.prototype.hasOwnProperty.call(bucket, key)) {
+      delete bucket[key];
+      return true;
+    }
+    return false;
+  }
+  if (next === current) return false;
+  bucket[key] = next;
+  return true;
+}
+
+function pruneDailyUsage() {
+  const all = billingStore.dailyImageUsage;
+  if (!all || typeof all !== "object") return false;
+
+  let changed = false;
+  const keys = Object.keys(all)
+    .filter((key) => usageDayKeyValid(key))
+    .sort();
+  const keepFrom = Math.max(0, keys.length - DAILY_USAGE_RETENTION_DAYS);
+  for (let i = 0; i < keepFrom; i += 1) {
+    if (Object.prototype.hasOwnProperty.call(all, keys[i])) {
+      delete all[keys[i]];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function dailyLimitError(payer, scope, limit, used, requested, dayKey) {
+  return {
+    ok: false,
+    reason: `daily-limit-${scope}`,
+    scope,
+    limit,
+    used,
+    requested,
+    remaining: Math.max(0, limit - used),
+    dayKey,
+    payerSocketId: payer?.id || ""
+  };
+}
+
+function checkDailyImageAllowance(room, nextRoundNumber) {
+  const payer = billingOwnerPlayer(room);
+  const accountId = sanitizeUserId(payer?.accountId || "");
+  const payerIp = normalizeIp(payer?.ip || "");
+  const payerFingerprint = sanitizeFingerprint(payer?.fingerprint || "");
+  const requested = Math.max(0, roundImageCount(room));
+  const dayKey = utcDayKey();
+  const dayStore = getUsageDay(dayKey, false);
+
+  if (DAILY_IMAGE_LIMIT_ACCOUNT > 0 && accountId) {
+    const used = usageCount(dayStore, "accounts", accountId);
+    if (used + requested > DAILY_IMAGE_LIMIT_ACCOUNT) {
+      return dailyLimitError(
+        payer,
+        "account",
+        DAILY_IMAGE_LIMIT_ACCOUNT,
+        used,
+        requested,
+        dayKey
+      );
+    }
+  }
+
+  if (DAILY_IMAGE_LIMIT_IP > 0 && payerIp) {
+    const used = usageCount(dayStore, "ips", payerIp);
+    if (used + requested > DAILY_IMAGE_LIMIT_IP) {
+      return dailyLimitError(payer, "ip", DAILY_IMAGE_LIMIT_IP, used, requested, dayKey);
+    }
+  }
+
+  if (DAILY_IMAGE_LIMIT_FINGERPRINT > 0 && payerFingerprint) {
+    const used = usageCount(dayStore, "fingerprints", payerFingerprint);
+    if (used + requested > DAILY_IMAGE_LIMIT_FINGERPRINT) {
+      return dailyLimitError(
+        payer,
+        "fingerprint",
+        DAILY_IMAGE_LIMIT_FINGERPRINT,
+        used,
+        requested,
+        dayKey
+      );
+    }
+  }
+
+  return {
+    ok: true,
+    payerSocketId: payer?.id || "",
+    accountId,
+    payerIp,
+    payerFingerprint,
+    requested,
+    dayKey,
+    roundNumber: nextRoundNumber
+  };
+}
+
+function reserveDailyImageAllowance(room, allowance) {
+  if (!room || !allowance?.ok) return;
+  const dayStore = getUsageDay(allowance.dayKey, true);
+  if (!dayStore) return;
+
+  let changed = false;
+  changed = adjustUsage(dayStore, "accounts", allowance.accountId, allowance.requested) || changed;
+  changed = adjustUsage(dayStore, "ips", allowance.payerIp, allowance.requested) || changed;
+  changed =
+    adjustUsage(dayStore, "fingerprints", allowance.payerFingerprint, allowance.requested) || changed;
+
+  room.pendingDailyUsage = {
+    dayKey: allowance.dayKey,
+    accountId: allowance.accountId,
+    ip: allowance.payerIp,
+    fingerprint: allowance.payerFingerprint,
+    images: allowance.requested,
+    roundNumber: allowance.roundNumber
+  };
+
+  if (changed || pruneDailyUsage()) {
+    persistBillingStore();
+  }
+}
+
+function rollbackPendingDailyUsage(room, reason = "usage-rollback") {
+  if (!room?.pendingDailyUsage) return;
+  const pending = room.pendingDailyUsage;
+  room.pendingDailyUsage = null;
+  const dayStore = getUsageDay(pending.dayKey, false);
+  if (!dayStore) return;
+
+  let changed = false;
+  changed = adjustUsage(dayStore, "accounts", pending.accountId, -pending.images) || changed;
+  changed = adjustUsage(dayStore, "ips", pending.ip, -pending.images) || changed;
+  changed = adjustUsage(dayStore, "fingerprints", pending.fingerprint, -pending.images) || changed;
+  if (changed || pruneDailyUsage()) {
+    appendLedger({
+      type: "daily-usage-rollback",
+      userId: pending.accountId,
+      dayKey: pending.dayKey,
+      images: pending.images,
+      reason
+    });
+    persistBillingStore();
+  }
+}
+
+function dailyLimitMessage(limitGate) {
+  const scopeLabel =
+    limitGate.scope === "account"
+      ? "your account"
+      : limitGate.scope === "ip"
+      ? "your network"
+      : "your device";
+  return `Daily image limit reached for ${scopeLabel}. Limit ${limitGate.limit} images/day, used ${limitGate.used}, next round needs ${limitGate.requested}.`;
 }
 
 function ensureBillingAccount(userId, ipRaw, fingerprintRaw = "") {
@@ -512,6 +748,10 @@ function billingSnapshot(accountId) {
     spentCents: Math.max(0, Number(account?.spentCents) || 0),
     imageCostCents: IMAGE_COST_CENTS,
     freePlayCents: FREE_PLAY_CENTS,
+    dailyImageLimitAccount: DAILY_IMAGE_LIMIT_ACCOUNT,
+    dailyImageLimitIp: DAILY_IMAGE_LIMIT_IP,
+    dailyImageLimitFingerprint: DAILY_IMAGE_LIMIT_FINGERPRINT,
+    dailyImageLimitDayKey: utcDayKey(),
     requiresLoginForCheckout: REQUIRE_LOGIN_FOR_CHECKOUT,
     packs: CREDIT_PACKS,
     stripeEnabled: Boolean(
@@ -733,12 +973,17 @@ function ensureRoundFunding(room, nextRoundNumber) {
 }
 
 function refundPendingRoundCharge(room, reason = "round-refund", meta = {}) {
-  if (!room?.pendingRoundCharge) return;
+  if (!room) return;
   const pending = room.pendingRoundCharge;
   room.pendingRoundCharge = null;
-  const externalId = `refund:${pending.roomId}:${pending.roundNumber}:${reason}`;
-  creditCredits(pending.accountId, pending.costCents, reason, externalId, meta);
-  emitBillingToAccount(pending.accountId);
+
+  if (pending) {
+    const externalId = `refund:${pending.roomId}:${pending.roundNumber}:${reason}`;
+    creditCredits(pending.accountId, pending.costCents, reason, externalId, meta);
+    emitBillingToAccount(pending.accountId);
+  }
+
+  rollbackPendingDailyUsage(room, reason);
 }
 
 const POWERUPS = {
@@ -1339,11 +1584,13 @@ async function similarityScore(referenceUrl, candidateUrl) {
   }
 }
 
-function createPlayer(socket, name, accountId = "") {
+function createPlayer(socket, name, accountId = "", ipRaw = "", fingerprintRaw = "") {
   return {
     id: socket.id,
     name: sanitizeName(name),
     accountId: sanitizeUserId(accountId),
+    ip: normalizeIp(ipRaw),
+    fingerprint: sanitizeFingerprint(fingerprintRaw),
     avatarId: "",
     score: 0,
     readyForNextRound: false,
@@ -1618,6 +1865,32 @@ async function startRound(room) {
 
   clearRoomTimers(room);
 
+  const limitGate = checkDailyImageAllowance(room, nextRoundNumber);
+  if (!limitGate.ok) {
+    const message = dailyLimitMessage(limitGate);
+    for (const player of room.players.values()) {
+      player.readyForNextRound = false;
+    }
+    room.phase = room.roundNumber > 0 ? "intermission" : "lobby";
+    io.to(room.id).emit("systemMessage", {
+      message
+    });
+    if (room.phase === "intermission") {
+      io.to(room.id).emit("readyUpStarted", {
+        modeId: room.modeId,
+        chaosRound: modeSupportsPowerups(room) && room.tiebreakerNextRound,
+        tiebreakerRound: room.tiebreakerNextRound,
+        totalPlayers: room.players.size
+      });
+    }
+    const targetSocket = limitGate.payerSocketId || room.hostId;
+    if (targetSocket) {
+      io.to(targetSocket).emit("errorMessage", { message });
+    }
+    emitRoomSnapshot(room);
+    return;
+  }
+
   const funding = ensureRoundFunding(room, nextRoundNumber);
   if (!funding.ok) {
     const balanceText = formatUsd(funding.balanceCents);
@@ -1650,6 +1923,7 @@ async function startRound(room) {
     emitRoomSnapshot(room);
     return;
   }
+  reserveDailyImageAllowance(room, limitGate);
 
   room.roundNumber = nextRoundNumber;
   room.phase = "round";
@@ -1751,6 +2025,7 @@ async function lockRound(roomId, reason) {
 
   room.phase = "generating";
   room.pendingRoundCharge = null;
+  room.pendingDailyUsage = null;
   if (room.roundTickTimer) {
     clearInterval(room.roundTickTimer);
     room.roundTickTimer = null;
@@ -2093,12 +2368,19 @@ function createRoom(socket, name) {
     showcaseTimer: null,
     startingNextRound: false,
     pendingRoundCharge: null,
+    pendingDailyUsage: null,
     roundEndsAt: 0,
     voteEndsAt: 0
   };
 
   const accountId = socketToAccount.get(socket.id) || "";
-  const player = createPlayer(socket, name, accountId);
+  const player = createPlayer(
+    socket,
+    name,
+    accountId,
+    resolveSocketIp(socket),
+    resolveSocketFingerprint(socket)
+  );
   room.players.set(socket.id, player);
 
   rooms.set(id, room);
@@ -2128,7 +2410,13 @@ function joinRoom(socket, roomId, name) {
   }
 
   const accountId = socketToAccount.get(socket.id) || "";
-  const player = createPlayer(socket, name, accountId);
+  const player = createPlayer(
+    socket,
+    name,
+    accountId,
+    resolveSocketIp(socket),
+    resolveSocketFingerprint(socket)
+  );
   room.players.set(socket.id, player);
 
   socketToRoom.set(socket.id, id);
@@ -2175,7 +2463,7 @@ function leaveCurrentRoom(socket) {
     room.votes = new Map();
     room.reference = null;
     room.pendingRoundCharge = null;
-    room.pendingRoundCharge = null;
+    room.pendingDailyUsage = null;
     io.to(room.id).emit("systemMessage", {
       message: "Not enough players to continue. Match reset to lobby."
     });
@@ -2872,6 +3160,8 @@ io.on("connection", (socket) => {
     room.revealOrder = [];
     room.votes = new Map();
     room.reference = null;
+    room.pendingRoundCharge = null;
+    room.pendingDailyUsage = null;
     if (room.modeId === "humanity") {
       room.sessionPromptPool = [];
       room.sessionPromptIndex = 0;
@@ -3012,6 +3302,7 @@ io.on("connection", (socket) => {
     room.votes = new Map();
     room.reference = null;
     room.pendingRoundCharge = null;
+    room.pendingDailyUsage = null;
     for (const p of room.players.values()) {
       p.score = 0;
       p.readyForNextRound = false;
@@ -3052,5 +3343,9 @@ server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(
     `Security: trustProxy=${JSON.stringify(TRUST_PROXY)} socketBindTtlMs=${SOCKET_BIND_TOKEN_TTL_MS} checkoutCooldownMs=${CHECKOUT_COOLDOWN_MS}`
+  );
+  // eslint-disable-next-line no-console
+  console.log(
+    `Daily image limits: account=${DAILY_IMAGE_LIMIT_ACCOUNT || "off"} ip=${DAILY_IMAGE_LIMIT_IP || "off"} fingerprint=${DAILY_IMAGE_LIMIT_FINGERPRINT || "off"} retentionDays=${DAILY_USAGE_RETENTION_DAYS}`
   );
 });

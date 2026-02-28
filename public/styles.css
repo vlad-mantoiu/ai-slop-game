@@ -465,6 +465,7 @@ textarea {
   cursor: pointer;
   display: grid;
   gap: 4px;
+  position: relative;
   transition: border-color 130ms ease, transform 130ms ease, background 130ms ease;
 }
 
@@ -482,6 +483,41 @@ textarea {
   cursor: default;
   opacity: 0.72;
   transform: none;
+}
+
+.mode-option[data-tooltip]:hover::after,
+.mode-option[data-tooltip]:focus-visible::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% + 10px);
+  background: rgba(8, 19, 27, 0.97);
+  border: 1px solid rgba(39, 199, 194, 0.55);
+  border-radius: 10px;
+  color: #ecfbff;
+  padding: 8px 10px;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  z-index: 8;
+  pointer-events: none;
+}
+
+.mode-option[data-tooltip]:hover::before,
+.mode-option[data-tooltip]:focus-visible::before {
+  content: "";
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 20px;
+  width: 10px;
+  height: 10px;
+  background: rgba(8, 19, 27, 0.97);
+  border-left: 1px solid rgba(39, 199, 194, 0.55);
+  border-top: 1px solid rgba(39, 199, 194, 0.55);
+  transform: rotate(225deg);
+  z-index: 8;
+  pointer-events: none;
 }
 
 .mode-option-title {

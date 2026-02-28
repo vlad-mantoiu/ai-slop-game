@@ -38,6 +38,7 @@ Realtime multiplayer web game (2-6 players) with two lobby-selectable modes:
   - `Against Humanity`: `players * IMAGE_COST_CENTS`
 - If host balance is insufficient, next round is blocked and host gets a pay prompt.
 - Billing data is persisted in `data/billing-store.json` (single-instance MVP).
+- Daily image generation caps are enforced before round start (host account, host IP, host device fingerprint).
 
 ### Stripe Top-Ups (Optional)
 
@@ -64,6 +65,10 @@ Optional hardening knobs:
 export TRUST_PROXY=1
 export CHECKOUT_COOLDOWN_MS=7000
 export SOCKET_BIND_TOKEN_TTL_MS=300000
+export DAILY_IMAGE_LIMIT_ACCOUNT=600
+export DAILY_IMAGE_LIMIT_IP=1200
+export DAILY_IMAGE_LIMIT_FINGERPRINT=900
+export DAILY_USAGE_RETENTION_DAYS=14
 ```
 
 ## Powerups
